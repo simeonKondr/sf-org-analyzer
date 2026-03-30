@@ -69,14 +69,21 @@ Proceeding...
 
 ```bash
 cat metadata/.retrieved_at 2>/dev/null || echo "NOT RETRIEVED"
+cat data/cpq/.retrieved_at 2>/dev/null || echo "CPQ DATA NOT RETRIEVED"
 ```
 
-If not retrieved or older than 24 hours:
+If either is not retrieved or older than 24 hours:
 ```bash
-bash scripts/retrieve.sh
+bash scripts/retrieve.sh   # retrieves both metadata and CPQ data
 ```
 
-Otherwise say: "Using metadata retrieved at [timestamp], skipping retrieve."
+To refresh only one phase:
+```bash
+bash scripts/retrieve.sh MyOrg meta   # XML metadata only
+bash scripts/retrieve.sh MyOrg cpq    # CPQ record data only
+```
+
+Otherwise say: "Using metadata from [timestamp] and CPQ data from [timestamp]."
 
 ---
 
@@ -180,6 +187,81 @@ rg "FIELD_PATTERN" metadata/objects/ --type xml | grep -i listview
 rg "FIELD_PATTERN" metadata/reports/ -l 2>/dev/null
 ```
 
+#### CPQ record data (local JSON — no callouts needed)
+```bash
+# Check if CPQ rules reference the field pattern
+grep -i "FIELD_PATTERN\|VALUE_PATTERN" data/cpq/price-rules.json
+grep -i "FIELD_PATTERN\|VALUE_PATTERN" data/cpq/price-conditions.json
+grep -i "FIELD_PATTERN\|VALUE_PATTERN" data/cpq/price-actions.json
+grep -i "FIELD_PATTERN\|VALUE_PATTERN" data/cpq/summary-variables.json
+grep -i "FIELD_PATTERN\|VALUE_PATTERN" data/cpq/product-rules.json
+grep -i "FIELD_PATTERN\|VALUE_PATTERN" data/cpq/custom-scripts.json
+grep -i "FIELD_PATTERN\|VALUE_PATTERN" data/cpq/custom-actions.json
+grep -i "FIELD_PATTERN\|VALUE_PATTERN" data/cpq/calculator-referenced-fields.json
+
+# Check which plugin classes are registered (from general-settings.json)
+cat data/cpq/general-settings.json | python3 -c "
+import sys, json
+d = json.load(sys.stdin)
+records = d.get('result', {}).get('records', [])
+if records:
+    r = records[0]
+    for k, v in r.items():
+        if v and k not in ['Id', 'attributes']:
+            print(f'  {k}: {v}')
+else:
+    print('  No general settings found')
+"
+
+# Confirm CPQ rule objects are truly empty (no callout needed — already local)
+python3 -c "
+import json, os
+files = {
+    'Price Rules':       'data/cpq/price-rules.json',
+    'Price Conditions':  'data/cpq/price-conditions.json',
+    'Price Actions':     'data/cpq/price-actions.json',
+    'Summary Variables': 'data/cpq/summary-variables.json',
+    'Product Rules':     'data/cpq/product-rules.json',
+    'Error Conditions':  'data/cpq/error-conditions.json',
+    'Custom Scripts':    'data/cpq/custom-scripts.json',
+    'Lookup Queries':    'data/cpq/lookup-queries.json',
+}
+for label, path in files.items():
+    if os.path.exists(path):
+        with open(path) as f:
+            d = json.load(f)
+        count = d.get('result', {}).get('totalSize', 0)
+        status = '✅ EMPTY' if count == 0 else f'⚠  {count} records — REVIEW'
+        print(f'  {label:25s}: {status}')
+    else:
+        print(f'  {label:25s}: file not found')
+"
+
+# Check product family distribution
+python3 -c "
+import json
+with open('data/cpq/products-all-families.json') as f:
+    d = json.load(f)
+print('  Product families in use:')
+for r in d.get('result', {}).get('records', []):
+    print(f'    {r[\"Family\"]:20s} {r[\"cnt\"]} products')
+"
+
+# Check Quote ARR orphaned fields — are any quotes actually populated?
+python3 -c "
+import json
+with open('data/cpq/quote-arr-sample.json') as f:
+    d = json.load(f)
+count = d.get('result', {}).get('totalSize', 0)
+if count == 0:
+    print('  ✅ Quote ARR pillar fields: ALL ZERO/NULL — orphaned fields confirmed')
+else:
+    print(f'  ⚠  {count} quotes have non-zero pillar ARR — these were set by old Price Rules')
+    for r in d.get('result', {}).get('records', [])[:3]:
+        print(f'    Opp: {r[\"SBQQ__Opportunity2__r\"][\"Name\"]} | Content: {r[\"ARR_Content__c\"]} | Discovery: {r[\"ARR_Discovery__c\"]}')
+"
+```
+
 ---
 
 ### Phase 5 — Runtime SOQL (targeted, MCP)
@@ -208,12 +290,28 @@ FROM CronTrigger
 WHERE State = 'WAITING'
 ORDER BY NextFireTime
 
--- Field descriptions for orphaned field detection
--- (only if a field's formula is blank but description references automation)
+-- Custom field description for orphaned field detection (Tooling API)
+-- Only run if local metadata doesn't include the field description
 SELECT Id, DeveloperName, Metadata
 FROM CustomField
 WHERE Id = 'FIELD_ID'  -- Tooling API, one at a time
 ```
+
+**Already covered locally — do NOT re-query via SOQL:**
+
+| Question | Local file |
+|---|---|
+| Are CPQ Price Rules configured? | `data/cpq/price-rules.json` |
+| Are Summary Variables configured? | `data/cpq/summary-variables.json` |
+| Are Custom Scripts configured? | `data/cpq/custom-scripts.json` |
+| What plugin classes are registered? | `data/cpq/general-settings.json` |
+| What product families exist? | `data/cpq/products-all-families.json` |
+| Are Quote ARR fields populated? | `data/cpq/quote-arr-sample.json` |
+| Subscription ARR by family | `data/cpq/subscription-arr-by-family.json` |
+| Opportunity ARR by pillar | `data/cpq/opportunity-arr-sample.json` |
+| Recently run reports | `data/cpq/reports-active.json` |
+| Dashboard list | `data/cpq/dashboards.json` |
+| Active scheduled jobs | `data/cpq/scheduled-jobs.json` |
 
 ---
 
@@ -269,6 +367,15 @@ If yes: `node scripts/docgen.js ./output/analysis-[timestamp].md`
 | Flexipage | `metadata/flexipages/*.flexipage-meta.xml` | `<field>` in components |
 | Report | `metadata/reports/**/*.report-meta.xml` | `<reportColumns>`, `<reportFilters>` |
 | Custom Metadata | `metadata/customMetadata/*.md-meta.xml` | Field value references |
+| CPQ Price Rules | `data/cpq/price-rules.json` | `SBQQ__LookupProductFamily__c`, field names in actions |
+| CPQ Price Actions | `data/cpq/price-actions.json` | `SBQQ__TargetField__c`, `SBQQ__Value__c` |
+| CPQ Price Conditions | `data/cpq/price-conditions.json` | `SBQQ__TestedField__c`, `SBQQ__FilterValue__c` |
+| CPQ Summary Variables | `data/cpq/summary-variables.json` | `SBQQ__Field__c`, `SBQQ__FilterField__c` |
+| CPQ Custom Scripts | `data/cpq/custom-scripts.json` | `SBQQ__Code__c` — full JS source |
+| CPQ General Settings | `data/cpq/general-settings.json` | Plugin class registrations |
+| CPQ Products | `data/cpq/products-active.json` | Family values, Product_Pillar__c |
+| Quote ARR audit | `data/cpq/quote-arr-sample.json` | Whether orphaned ARR fields have any data |
+| Active reports | `data/cpq/reports-active.json` | Name, FolderName, LastRunDate |
 
 ---
 
