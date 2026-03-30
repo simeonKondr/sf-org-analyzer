@@ -1,0 +1,28 @@
+# Retrieved metadata — large, org-specific, regenerate with /retrieve
+metadata/
+
+# Analysis cache
+cache/
+
+# Generated output files
+output/
+
+# Node
+node_modules/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Salesforce CLI
+.sf/
+.sfdx/
+
+# Logs
+*.log
+/tmp/retrieve-log.txt
+
+# Sensitive
+.env
+*.pem
+*.key

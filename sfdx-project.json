@@ -1,0 +1,12 @@
+{
+  "packageDirectories": [
+    {
+      "path": "metadata",
+      "default": true
+    }
+  ],
+  "name": "sf-org-analyzer",
+  "namespace": "",
+  "sfdcLoginUrl": "https://login.salesforce.com",
+  "sourceApiVersion": "62.0"
+}
