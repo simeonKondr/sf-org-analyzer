@@ -1,0 +1,16 @@
+{
+  "name": "sf-org-analyzer",
+  "version": "1.0.0",
+  "description": "Claude Code project for deep Salesforce org analysis",
+  "scripts": {
+    "retrieve": "bash scripts/retrieve.sh",
+    "scan": "bash scripts/scan.sh",
+    "docgen": "node scripts/docgen.js"
+  },
+  "dependencies": {
+    "docx": "^8.5.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
