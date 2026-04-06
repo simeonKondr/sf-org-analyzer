@@ -45,20 +45,31 @@ LIMIT 100
 
 **Reports matching a pattern**
 ```sql
-SELECT Id, Name, LastRunDate, FolderName
+SELECT Id, Name, LastRunDate, FolderName, Description
 FROM Report
 WHERE (Name LIKE '%Pillar%' OR Name LIKE '%Product Family%' OR Name LIKE '%ARR%')
-  AND LastRunDate != null
-ORDER BY LastRunDate DESC
+ORDER BY LastRunDate DESC NULLS LAST
 ```
 
 **Dashboards matching a pattern**
 ```sql
-SELECT Id, Title, LastModifiedDate, FolderName
+SELECT Id, Title, LastModifiedDate, FolderName, Description
 FROM Dashboard
 WHERE Title LIKE '%Pillar%' OR Title LIKE '%Discovery%' OR Title LIKE '%ARR%'
 ORDER BY LastModifiedDate DESC
 ```
+
+**Report column detail — use when name-matching is insufficient**
+(Tooling API — gives full column and filter metadata for a specific report)
+```sql
+SELECT Id, Name, FolderName, Metadata
+FROM Report
+WHERE Name LIKE '%Product Family%'
+LIMIT 10
+```
+Note: `Metadata` is a compound JSON field available only via `--use-tooling-api`.
+Parse `Metadata.columns[].columnName` for field references and
+`Metadata.filter.criteriaItems[].column` + `.value` for filter fields and values.
 
 **Active scheduled jobs**
 ```sql

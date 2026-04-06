@@ -1,0 +1,31 @@
+# org.config — Salesforce org configuration
+# ─────────────────────────────────────────��───────────────────────────────────
+# 1. Copy this file:   cp org.config.example org.config
+# 2. Fill in your values below
+# 3. org.config is gitignored — your org details are never committed
+#
+# This file is sourced by scripts/retrieve.sh and read by all scripts.
+# The end user only needs to edit this file — nothing else.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# sf CLI org alias — run `sf org list` to see your aliases
+ORG_ALIAS=""
+
+# Login URL / instance URL
+ORG_INSTANCE=""           # e.g. https://myorg.sandbox.my.salesforce.com
+                          #  or  https://myorg.my.salesforce.com
+
+# Is Salesforce CPQ (SBQQ managed package) installed?
+CPQ_INSTALLED="false"     # true | false
+
+# Admin mode — allows AI tools (Claude) to autonomously edit project scripts and tooling.
+# When false (default): Claude reports issues and suggestions but makes NO edits to scripts,
+# indexes, or any project file. Analysis and SOQL queries still run normally.
+# When true: Claude may edit scripts/index.py, retrieve.sh, analyze.md, CLAUDE.md, etc.
+# This flag must be set MANUALLY by the user — Claude will never set it to true itself.
+ADMIN_MODE="false"        # true | false
+
+# Dry run — when true, forces a fresh metadata retrieval from the org before any analysis,
+# ignoring the normal 24-hour freshness check on metadata/.retrieved_at.
+# Use this after deploying changes to the org or when you know metadata is stale.
+DRY_RUN="false"           # true | false

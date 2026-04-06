@@ -25,16 +25,26 @@ OUTPUT_DIR="./metadata"
 DATA_DIR="./data/cpq"
 TIMESTAMP_FILE="$OUTPUT_DIR/.retrieved_at"
 
-# ── Resolve org ───────────────────────────────────────────────────────────────
-if [ -z "$ALIAS" ]; then
-  if [ -f "CLAUDE.md" ]; then
-    ALIAS=$(grep -oP '(?<=Alias:\s{0,10})\S+' CLAUDE.md | head -1 || true)
-  fi
+# ── Load org config ───────────────────────────────────────────────────────────
+# org.config is the single source of truth for org-specific settings.
+# It is gitignored — copy org.config.example to org.config to get started.
+if [ -f "org.config" ]; then
+  # shellcheck source=org.config
+  source org.config
+fi
+
+# ── Resolve org alias ─────────────────────────────────────────────────────────
+# Priority: CLI arg → org.config ORG_ALIAS → error
+if [ -z "$ALIAS" ] && [ -n "${ORG_ALIAS:-}" ]; then
+  ALIAS="$ORG_ALIAS"
 fi
 
 if [ -z "$ALIAS" ]; then
-  echo "ERROR: No org alias provided and none found in CLAUDE.md"
-  echo "Usage: bash scripts/retrieve.sh <OrgAlias> [meta|cpq|all]"
+  echo "ERROR: No org alias provided."
+  echo ""
+  echo "  Option 1 — pass as argument:  bash scripts/retrieve.sh MyOrgAlias"
+  echo "  Option 2 — set in org.config: copy org.config.example → org.config"
+  echo "             then set ORG_ALIAS=MyOrgAlias"
   exit 1
 fi
 
@@ -251,7 +261,7 @@ export_query() {
       --query "$query" \
       --target-org "$ALIAS" \
       $tooling_flag \
-      --json 2>&1); then
+      --json); then
     # Strip sf CLI wrapper + per-record attributes — store only the records array
     local count
     count=$(echo "$result" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('result',{}).get('totalSize',0))" 2>/dev/null || echo "?")
@@ -400,7 +410,11 @@ print(' '.join(fields))
     SBQQ__Operator__c \
     SBQQ__FilterValue__c \
     SBQQ__FilterType__c \
-    SBQQ__Index__c
+    SBQQ__Index__c \
+    SBQQ__Field__c \
+    SBQQ__Value__c \
+    SBQQ__FilterFormula__c \
+    SBQQ__Object__c
 
   export_query_safe \
     "Price Actions" \
@@ -414,7 +428,9 @@ print(' '.join(fields))
     SBQQ__ValueType__c \
     SBQQ__Value__c \
     SBQQ__SourceVariable__c \
-    SBQQ__Index__c
+    SBQQ__Index__c \
+    SBQQ__Field__c \
+    SBQQ__Formula__c
 
   # ── Summary Variables ─────────────────────────────────────────────────────────
   echo ""
@@ -434,7 +450,9 @@ print(' '.join(fields))
     SBQQ__FilterField__c \
     SBQQ__FilterOperator__c \
     SBQQ__FilterValue__c \
-    SBQQ__ConditionsMet__c
+    SBQQ__ConditionsMet__c \
+    SBQQ__TargetField__c \
+    SBQQ__FilterFormula__c
 
   # ── Product Rules ─────────────────────────────────────────────────────────────
   echo ""
@@ -455,6 +473,7 @@ print(' '.join(fields))
     SBQQ__EvaluationEvent__c \
     SBQQ__EvaluationOrder__c \
     SBQQ__ErrorMessage__c \
+    SBQQ__ErrorConditionFormula__c \
     LastModifiedDate
 
   export_query_safe \
@@ -467,7 +486,10 @@ print(' '.join(fields))
     SBQQ__Operator__c \
     SBQQ__FilterValue__c \
     SBQQ__FilterType__c \
-    SBQQ__Index__c
+    SBQQ__Index__c \
+    SBQQ__Field__c \
+    SBQQ__FilterFormula__c \
+    SBQQ__Object__c
 
   export_query_safe \
     "Configuration Rules" \
@@ -532,10 +554,56 @@ print(' '.join(fields))
     SBQQ__MatchField__c \
     SBQQ__ResultField__c \
     SBQQ__DefaultField__c \
-    SBQQ__PriceRule__c
+    SBQQ__PriceRule__c \
+    SBQQ__Query__c \
+    SBQQ__ValueField__c \
+    SBQQ__LookupField__c
+
+  export_query_safe \
+    "Lookup Query Lines" \
+    "lookup-query-lines.json" \
+    "SBQQ__LookupQueryLine__c" \
+    "" "" "LIMIT 2000" \
+    SBQQ__LookupQuery__c \
+    SBQQ__Field__c \
+    SBQQ__Value__c
 
   export_query "Lookup Data" "lookup-data.json" \
     "SELECT Id, Name FROM SBQQ__LookupData__c ORDER BY Name LIMIT 500"
+
+  # ── Configuration Attributes, Product Options, Search Filters ─────────────────
+  echo ""
+  echo "  [ Configuration Attributes / Product Options / Search Filters ]"
+
+  export_query_safe \
+    "Configuration Attributes" \
+    "configuration-attributes.json" \
+    "SBQQ__ConfigurationAttribute__c" \
+    "" "Name" "LIMIT 1000" \
+    SBQQ__Product__c \
+    SBQQ__TargetField__c \
+    SBQQ__DefaultValue__c \
+    SBQQ__Hidden__c \
+    SBQQ__Required__c
+
+  export_query_safe \
+    "Product Options" \
+    "product-options.json" \
+    "SBQQ__ProductOption__c" \
+    "" "" "LIMIT 2000" \
+    SBQQ__ConfiguredSKU__c \
+    SBQQ__Component__c \
+    SBQQ__Filter__c
+
+  export_query_safe \
+    "Search Filters" \
+    "search-filters.json" \
+    "SBQQ__SearchFilter__c" \
+    "" "" "LIMIT 1000" \
+    SBQQ__Field__c \
+    SBQQ__Value__c \
+    SBQQ__Operator__c \
+    SBQQ__FilterType__c
 
   # ── Calculator Referenced Fields ──────────────────────────────────────────────
   echo ""
@@ -679,6 +747,16 @@ print(' '.join(fields))
   echo ""
   echo "  [ Reports & Dashboards ]"
 
+  # All reports — full list for name/folder/description matching in index
+  export_query \
+    "All reports" \
+    "reports-all.json" \
+    "SELECT Id, Name, DeveloperName, FolderName, Format, Description, LastRunDate
+     FROM Report
+     ORDER BY Name
+     LIMIT 2000"
+
+  # Reports run recently — used to enrich LastRunDate in index
   export_query \
     "Reports run in last 90 days" \
     "reports-active.json" \
@@ -688,13 +766,35 @@ print(' '.join(fields))
      ORDER BY LastRunDate DESC
      LIMIT 500"
 
+  # All dashboards with description
   export_query \
     "Dashboards (all)" \
     "dashboards.json" \
-    "SELECT Id, Title, DeveloperName, LastModifiedDate, FolderName
+    "SELECT Id, Title, DeveloperName, LastModifiedDate, FolderName, Description
      FROM Dashboard
      ORDER BY LastModifiedDate DESC
      LIMIT 500"
+
+  # Dashboard components — which reports each dashboard references (Tooling API)
+  printf "  %-50s" "Dashboard components (Tooling)..."
+  if result=$(sf data query \
+      --query "SELECT Id, DashboardId, Name, Type FROM DashboardComponent LIMIT 2000" \
+      --target-org "$ALIAS" \
+      --use-tooling-api \
+      --json 2>/dev/null); then
+    echo "$result" | python3 -c "
+import sys,json
+d=json.load(sys.stdin)
+records=d.get('result',{}).get('records',[])
+for r in records: r.pop('attributes',None)
+print(json.dumps(records))
+" 2>/dev/null > "$DATA_DIR/dashboard-components.json" || echo '[]' > "$DATA_DIR/dashboard-components.json"
+    count=$(python3 -c "import json; print(len(json.load(open('$DATA_DIR/dashboard-components.json'))))" 2>/dev/null || echo "?")
+    echo " $count records"
+  else
+    echo '[]' > "$DATA_DIR/dashboard-components.json"
+    echo " skipped (Tooling API unavailable)"
+  fi
 
   # ── Scheduled Jobs ────────────────────────────────────────────────────────────
   # Standard object — always safe

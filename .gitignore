@@ -1,11 +1,20 @@
+# Org configuration — contains alias, instance URL; never commit
+org.config
+
 # Retrieved metadata — large, org-specific, regenerate with /retrieve
 metadata/
 
-# Analysis cache
+# Exported org data (CPQ records, reports, dashboards, product catalog)
+data/
+
+# Analysis cache — rebuilt from metadata
 cache/
 
 # Generated output files
 output/
+
+# Org-specific analysis findings (gitignore by naming convention)
+docs/bloomreach-*.md
 
 # Node
 node_modules/

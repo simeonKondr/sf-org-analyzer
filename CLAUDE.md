@@ -1,11 +1,11 @@
 # sf-org-analyzer — Project Context
 
-This repository is a Claude Code project for deep Salesforce org metadata analysis.
-It was built during an extended analysis session of the BloomreachAWR org.
+A Claude Code project for deep Salesforce org metadata analysis.
 
-**Read `docs/bloomreach-audit-findings.md` before doing anything org-specific.**
-It contains the complete findings from the previous analysis session so you don't
-re-discover things already documented.
+**Before starting any org-specific work**, check whether prior findings exist:
+```bash
+ls docs/ 2>/dev/null && cat docs/*-findings.md 2>/dev/null || echo "No prior findings."
+```
 
 ---
 
@@ -18,20 +18,46 @@ Only stop if:
 - The user's request is genuinely ambiguous (e.g. org alias not specified)
 - A destructive action is about to happen that wasn't requested
 
+### Admin mode
+
+Read `ADMIN_MODE` from `org.config` at the start of every session:
+
+```bash
+source org.config 2>/dev/null && echo "ADMIN_MODE=$ADMIN_MODE  DRY_RUN=$DRY_RUN"
+```
+
+**`ADMIN_MODE=false` (default):**
+- Do NOT edit any project files: scripts, indexes, commands, CLAUDE.md, README.
+- Analysis runs normally — bash commands, SOQL queries, cache reads, and output writes are all fine.
+- When you find an issue in tooling or scripts, report it clearly but do not fix it.
+- This flag can only be changed manually by the user. Never set it to true yourself.
+
+**`ADMIN_MODE=true`:**
+- Full edit access: scripts, indexes, commands, CLAUDE.md, README, docgen.js, etc.
+- Apply fixes to tooling issues found during analysis.
+- Still never fix org issues (metadata, Apex, flows, workflow rules, fields).
+
 ---
 
 ## Org config
 
+Stored in `org.config` (gitignored — never committed). Read it at the start of any session:
+
+```bash
+cat org.config 2>/dev/null || echo "org.config not found — copy org.config.example to get started"
 ```
-Alias:    BloomreachAWR
-Type:     Sandbox
-Instance: https://bloomreach--awr.sandbox.my.salesforce.com
-CPQ:      Installed (SBQQ managed package)
+
+To get the active alias for use in commands:
+```bash
+source org.config 2>/dev/null && echo "$ORG_ALIAS"
 ```
+
+All scripts source `org.config` automatically. Never hardcode the alias — always use `$ORG_ALIAS`.
 
 ---
 
 ## Critical rule — never hardcode CPQ or custom field names in SOQL
+## Critical rule — never hardcode target-org. always use ORG_ALIAS from org.config
 
 CPQ managed package field availability varies by version.
 Org-specific custom fields vary by org.
@@ -45,7 +71,7 @@ sf data query \
   --query "SELECT QualifiedApiName FROM FieldDefinition
            WHERE EntityDefinition.QualifiedApiName = 'SBQQ__PriceRule__c'
            ORDER BY QualifiedApiName" \
-  --target-org BloomreachAWR \
+  --target-org "$ORG_ALIAS" \
   --json | python3 -c "
 import sys, json
 fields = [r['QualifiedApiName']
@@ -97,10 +123,15 @@ SBQQ__QuoteLine__c, SBQQ__Quote__c, SBQQ__Subscription__c, Case`
 ### Phase 2 — Check metadata freshness
 
 ```bash
+source org.config 2>/dev/null
 cat metadata/.retrieved_at 2>/dev/null || echo "NOT RETRIEVED"
 ```
 
-Retrieve if not retrieved or older than 24 hours:
+Retrieve if any of the following are true:
+- Metadata has never been retrieved
+- Metadata is older than 24 hours
+- `DRY_RUN=true` in org.config (forces fresh retrieval regardless of age)
+
 ```bash
 bash scripts/retrieve.sh
 ```
@@ -126,22 +157,45 @@ rg -i "$PATTERN" metadata/ --type xml -o --no-filename \
 
 **Step 1 — Check the pre-built indexes first:**
 ```bash
-# What writes this field?
-grep -i "FIELD_NAME" cache/field-writers-index.tsv
-
-# What flows touch this object/field?
+# All automations reading or writing this field (Apex, Flow, Trigger)
 python3 -c "
 import json
-flows = json.load(open('cache/flows-index.json'))
-hits = [f for f in flows if any('PATTERN' in w for w in f.get('writes',[]) + f.get('conds',[]))]
-for h in hits: print(h['file'], '|', h['type'], '|', h['obj'], '| writes:', h['writes'])
+usage = json.load(open('cache/field-usage-index.json'))
+for field, hits in usage.items():
+    if 'PATTERN' in field:
+        for h in hits: print(field, '|', h['type'], h['usage'], '|', h['file'], '|', h['context'])
 "
 
-# What Apex classes write this field?
+# Flows touching this field (writes or conditions)
 python3 -c "
 import json
-for c in json.load(open('cache/apex-index.json')):
-    if any('PATTERN' in w for w in c['writes']): print(c['file'], c['writes'])
+for f in json.load(open('cache/flows-index.json')):
+    if any('PATTERN' in str(x) for x in f.get('writes',[]) + f.get('conds',[])):
+        print(f['file'], '|', f['obj'], f['event'], '| writes:', f['writes'])
+"
+
+# Validation rules referencing this field or value
+python3 -c "
+import json
+for r in json.load(open('cache/validation-rules-index.json')):
+    if any('PATTERN' in x for x in r.get('fields',[]) + r.get('values',[])):
+        print(r['object'], r['name'], '| active:', r['active'], '| fields:', r['fields'], '| values:', r['values'])
+"
+
+# Workflow rules referencing this field or value
+python3 -c "
+import json
+for r in json.load(open('cache/workflow-rules-index.json')):
+    if any('PATTERN' in x for x in r.get('fields',[]) + r.get('values',[])):
+        print(r['object'], r['name'], '| active:', r['active'], '| writes:', r['writes'], '| values:', r['values'])
+"
+
+# Reports using this field in columns or filters
+python3 -c "
+import json
+for r in json.load(open('cache/reports-index.json')):
+    if any('PATTERN' in x for x in r.get('fields',[]) + r.get('filter_values',[])):
+        print(r['name'], '| folder:', r['folder'], '| fields:', r['fields'])
 "
 ```
 
@@ -160,9 +214,8 @@ For every match: explain what each automation actually does (trigger, condition,
 
 ### Phase 5 — Runtime SOQL (targeted)
 
-**Skip queries already answered in Known Facts below** — do not re-confirm
-CPQ object counts documented as EMPTY, and do not re-query fields confirmed
-as orphaned. Check `data/cpq/cpq-status.json` before any CPQ queries.
+Check `data/cpq/cpq-status.json` before any CPQ queries to avoid re-querying
+objects already confirmed empty.
 
 Run only what you need for *live runtime data*:
 ```sql
@@ -184,16 +237,21 @@ Ask if the user wants a Word document: `node scripts/docgen.js ./output/analysis
 
 ## Scan matrix
 
-| Metadata type | File location | What to look for |
-|---|---|---|
-| Apex | `metadata/classes/*.cls` | Field refs, string comparisons, SOQL |
-| Flow | `metadata/flows/*.flow-meta.xml` | `<field>`, `<stringValue>`, `<assignToReference>` |
-| Object/Field | `metadata/objects/**/*.field-meta.xml` | `<formula>`, `<description>`, `<summaryFilterItems>` |
-| Layout | `metadata/layouts/*.layout-meta.xml` | `<field>` in layout sections |
-| Workflow | `metadata/workflows/*.workflow-meta.xml` | `<field>`, `<criteriaItems>`, `<fieldUpdates>` |
-| Validation | `metadata/objects/**/*.validationRule-meta.xml` | `<errorConditionFormula>` |
-| Flexipage | `metadata/flexipages/*.flexipage-meta.xml` | `<field>` in components |
-| Report | `metadata/reports/**/*.report-meta.xml` | `<reportColumns>`, `<reportFilters>` |
+`[indexed]` = covered by cache; start here. `[scan]` = grep raw files if not answered by index.
+
+| Metadata type | Cache index | Raw file location | What to look for |
+|---|---|---|---|
+| Apex | `apex-index.json` reads+writes **[indexed]** | `metadata/classes/*.cls` | Field refs, SOQL, string comparisons |
+| Trigger | `triggers-index.json` reads+writes **[indexed]** | `metadata/triggers/*.trigger` | Field refs, events, constants |
+| Flow | `flows-index.json` writes+conds **[indexed]** | `metadata/flows/*.flow-meta.xml` | `<assignToReference>`, `<stringValue>` |
+| Object/Field | `fields-index.tsv` **[indexed]** | `metadata/objects/**/*.field-meta.xml` | `<formula>`, `<description>`, `<summaryFilterItems>` |
+| Validation rule | `validation-rules-index.json` **[indexed]** | `metadata/objects/**/*.validationRule-meta.xml` | `<errorConditionFormula>`, ISPICKVAL values |
+| Workflow rule | `workflow-rules-index.json` **[indexed]** | `metadata/workflows/*.workflow-meta.xml` | `<criteriaItems>`, `<fieldUpdates>` |
+| Report | `reports-index.json` (name/folder/desc) **[indexed]** | `data/cpq/reports-all.json` — XML not retrievable | Name + folder matching; column-level needs `/runtime` |
+| Dashboard | `dashboards-index.json` (name/folder/components) **[indexed]** | `data/cpq/dashboards.json` + `dashboard-components.json` | Name + component matching |
+| Layout | *(none — structural only)* **[scan]** | `metadata/layouts/*.layout-meta.xml` | `<field>` in layout sections |
+| Flexipage | *(none)* **[scan]** | `metadata/flexipages/*.flexipage-meta.xml` | `<field>` in components |
+| CPQ rules | `cpq-field-usage-index.json` **[indexed]** | `data/cpq/*.json` | Parent-child field references |
 
 ---
 
@@ -245,132 +303,3 @@ sf-org-analyzer/
 | `/retrieve [alias]` | Force fresh metadata + CPQ data retrieval |
 | `/runtime <question>` | Live SOQL queries for runtime data only |
 
----
-
-## Known facts about BloomreachAWR org
-
-These are confirmed findings — do not re-discover or re-query for these.
-
-### CPQ configuration
-- CPQ installed: YES (SBQQ managed package)
-- Price Rules: **EMPTY** (0 records) — deleted, not in use
-- Price Actions: **EMPTY** (0 records)
-- Price Conditions: **EMPTY** (0 records)
-- Summary Variables: **EMPTY** (0 records)
-- Product Rules: **EMPTY** (0 records)
-- Error Conditions: **EMPTY** (0 records)
-- Configuration Rules: **EMPTY** (0 records)
-- Custom Scripts: **EMPTY** (0 records)
-- Lookup Queries: **EMPTY** (0 records)
-- Custom Actions: 36 records — ALL standard CPQ UI buttons, none custom
-- QuoteCalculatorPlugin: NOT implemented (no custom Apex implements it)
-
-### ARR computation — actual working path
-1. `SBQQ__QuoteLine__c.Product_Line_ARR_Total__c` [FORMULA]
-   = `IF(ISBLANK(ARR_Override__c), IF(Revenue_Type__c='Recurring', SBQQ__NetTotal__c/Expected_Term__c*12, 0), ARR_Override__c)`
-2. CPQ contracts Quote → creates OLIs
-3. `OpportunityLineItemTriggerHandler` Apex reads `OLI.Product_Family__c`
-   → writes `Opportunity.ARR_Content/Discovery/Engagement/Y1_*__c`
-4. `SubscriptionArrCalculator` Apex (nightly + renewal trigger)
-   reads `SBQQ__Subscription__c.Product_Line_ARR_Total__c`
-   → writes `Opportunity.ARR_Renewal_Base_*__c`
-
-### Critical: orphaned Quote ARR fields
-`SBQQ__Quote__c.ARR_Content__c`, `ARR_Discovery__c`, `ARR_Engagement__c`,
-`ARR_Engagement_Subscription__c`, `ARR_Engagement_Services__c`
-— field descriptions reference "Price Rule 'Q: Update ARR Fields'" which was deleted.
-— **no current automated writer exists for these fields**
-— `Update_Opportunity_Fields_From_Quote` flow reads them and pushes zero/null to Opportunity
-— CONFIRMED ISSUE: this means CPQ deals get ARR zeroed on every Quote save
-
-### Product pillar values
-- Active: Discovery (brSM), Content (brXM), Engagement (brEX), Clarity, Services
-- Partially retired: SEO/brSEO (CD-004625, June 2024)
-  — removed from Opp formula but still in Product2 formula
-
-### Deprecated fields still live on Opportunity
-- `Product_Pillar__c` (formula — labeled deprecated)
-- `Opportunity_Product_Family__c` (formula — labeled deprecated)
-- `Product_Family_Group__c` (formula — labeled deprecated)
-
-### Clarity missing from total ARR
-- `ARR_Y1_Clarity__c` exists (written by Apex Y1 path)
-- `ARR_Renewal_Base_Clarity__c` exists (written by SubscriptionArrCalculator)
-- `ARR_Clarity__c` total field **does NOT exist**
-- Clarity deals always show zero in total ARR by pillar reports
-
-### Double-write on Opportunity ARR fields
-`ARR_Content__c`, `ARR_Discovery__c`, `ARR_Engagement_Subscription__c`,
-`ARR_Engagement_Services__c` are written by BOTH:
-- `OpportunityLineItemTriggerHandler` Apex (after every OLI change)
-- `Update_Opportunity_Fields_From_Quote` Flow (after every CPQ Quote save)
-No mutual exclusion exists between them.
-
-### Finance lock gate issue
-`Update_Opportunity_Fields_From_Quote` flow is blocked when
-`Finance_Reviewed__c = true` on the Opportunity.
-Apex trigger still fires. Silent data inconsistency on locked opps.
-
----
-
-## Previous deliverable
-
-A complete Word document was generated:
-`ProductFamily_Pillar_Complete_Analysis.docx` (15 sections, landscape, ~44KB)
-
-Sections covered:
-1. Executive Summary (7 critical issues)
-2. Field Inventory (all objects)
-3. Legacy Code Mapping
-4. Apex Classes (8 classes documented)
-5. Flows (20+ flows)
-6. Workflow Rules
-7. CPQ Price Rules & Summary Variables
-8. rh2 Rollup Helper
-9. Validation Rules
-10. Dependency Chains (4 ASCII diagrams)
-11. Page Layouts / Lightning Pages / List Views
-12. Known Issues & Recommendations
-13. Complete Automation Inventory (30 automations)
-14. CPQ Price Rules, Product Rules & Custom Scripts — Full Audit
-15. Glossary
-
----
-
-## What was NOT completed in the prior session
-
-1. **Reports and dashboards section** — queries were run and data obtained,
-   but the document was NOT updated with reports/dashboards findings before
-   the session ended. The raw data is in `docs/bloomreach-reports-dashboards-raw.md`.
-
-2. **Tooling API metadata for report columns/filters** — we identified which
-   reports were recently run by name pattern, but did NOT retrieve the actual
-   field API names used in each report's columns and filters via Tooling API.
-
-3. **Dashboard component cross-reference** — we did not query
-   `DashboardComponent` to map which reports feed which dashboard widgets.
-
----
-
-## Pending next steps
-
-1. Complete the reports & dashboards analysis:
-   - Fetch report metadata via Tooling API to get actual column/filter field names
-   - Cross-reference dashboard components to reports
-   - Identify which reports read the orphaned Quote ARR fields
-   - Update the Word document with Section 15 (Reports & Dashboards)
-
-2. Fix recommendation for orphaned Quote ARR fields (implement one of):
-   - Option 1 (recommended): Rewrite `Update_Opportunity_Fields_From_Quote`
-     flow to aggregate from Quote Lines by `Product_Family__c` directly
-   - Option 2: Restore CPQ Price Rules and Summary Variables
-   - Option 3: Implement `SBQQ.QuoteCalculatorPlugin` in Apex
-
-3. Fix recommendation for Clarity total ARR gap:
-   - Create `ARR_Clarity__c` Currency field on Opportunity
-   - Add to `OpportunityLineItemTriggerHandler` rollupArr() method
-   - Add to CPQ flow assignments
-
-4. Push `sf-org-analyzer` repo to GitHub (simeonKondr account):
-   - Previous attempt failed: "simeonKondr does not have correct permissions to execute CreateRepository"
-   - Fix: `gh auth login --scopes repo` or create repo manually on github.com then push

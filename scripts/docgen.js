@@ -115,10 +115,6 @@ function spacer() {
   return new Paragraph({ spacing: { before: 80, after: 80 }, children: [new TextRun("")] });
 }
 
-function pageBreak() {
-  return new Paragraph({ children: [new PageBreak()] });
-}
-
 // ── Markdown parser ───────────────────────────────────────────────────────────
 // Simple line-by-line parser — handles headings, bullets, code blocks, tables
 function parseMarkdown(md) {

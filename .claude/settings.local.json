@@ -42,7 +42,12 @@
       "Bash(wc -l /Users/simeonkondrashev/Downloads/sf-org-analyzer-main/metadata/flexipages/*.flexipage-meta.xml)",
       "Bash(wc -l /Users/simeonkondrashev/Downloads/sf-org-analyzer-main/metadata/reports/*.report-meta.xml)",
       "Bash(xargs du:*)",
-      "Bash(bash scripts/index.sh)"
+      "Bash(bash scripts/index.sh)",
+      "Bash(tee /Users/simeonkondrashev/Downloads/sf-org-analyzer-main/cache/discovered-fields.txt)",
+      "Bash(/usr/local/bin/node scripts/docgen.js ./output/product-family-pillar-analysis-2026-04-06.md)",
+      "Bash(python3 -c \"import json; d=json.load\\(open\\(''''data/cpq/reports-active.json''''\\)\\); print\\(d[:2] if d else ''''EMPTY''''\\)\")",
+      "Bash(/usr/local/lib/sf/bin/sf org:*)",
+      "Bash(/Users/simeonkondrashev/Downloads/sf-org-analyzer-main/org.config:*)"
     ]
   }
 }
