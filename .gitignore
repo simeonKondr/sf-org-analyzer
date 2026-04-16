@@ -3,6 +3,7 @@ org.config
 
 # Retrieved metadata — large, org-specific, regenerate with /retrieve
 metadata/
+retrieved/
 
 # Exported org data (CPQ records, reports, dashboards, product catalog)
 data/
