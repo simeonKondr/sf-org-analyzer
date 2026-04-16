@@ -36,7 +36,7 @@ Reading it costs nothing additional — the model attends over what's already pr
 With MCP, every query generates output tokens and permanently adds the result JSON
 to the context. 50 queries × average 2KB JSON each = 100KB context growth.
 
-For the BloomreachAWR analysis, the MCP-only approach used roughly 5x more tokens
+For the analysis, the MCP-only approach used roughly 5x more tokens
 than the archive approach for the same structural information.
 
 ---
