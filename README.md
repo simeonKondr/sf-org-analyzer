@@ -10,7 +10,7 @@ Metadata is retrieved once and indexed locally. All structural questions are ans
 
 Ask a question like:
 
-> "Find all automations and processes where Product Family, Product Pillar and values like Engagement, Discovery, Content, Clarity are used"
+> "Find all automations and processes where Product Family and values like value 1 and value 2 are used"
 
 And it:
 
