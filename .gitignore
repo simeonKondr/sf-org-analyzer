@@ -15,7 +15,7 @@ cache/
 output/
 
 # Org-specific analysis findings (gitignore by naming convention)
-docs/bloomreach-*.md
+docs/
 
 # Node
 node_modules/
