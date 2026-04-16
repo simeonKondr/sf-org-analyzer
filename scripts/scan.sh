@@ -14,8 +14,8 @@
 #   compact  — matching line + line number only, no context, no truncation
 #              Use compact for broad discovery; verbose when you need context
 #
-# TIP: Always check cache/field-writers-index.tsv and cache/flows-index.json
-#      before running a full scan — they answer "what writes X?" instantly.
+# TIP: Always check cache/field-usage-index.json and cache/flows-index.json
+#      before running a full scan — they answer "what reads/writes X?" instantly.
 
 set -euo pipefail
 

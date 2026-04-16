@@ -65,125 +65,23 @@ retrieve_metadata() {
   mkdir -p "$OUTPUT_DIR"
 
   METADATA_TYPES=(
-    "ActionLinkGroupTemplate"
-    "AnalyticSnapshot"
+    # ── Code ──────────────────────────────────────────────────────────────────
     "ApexClass"
     "ApexComponent"
     "ApexPage"
-    "ApexTestSuite"
     "ApexTrigger"
-    "AppMenu"
+
+    # ── Automation ────────────────────────────────────────────────────────────
     "ApprovalProcess"
     "AssignmentRule"
     "AssignmentRules"
-    "Audience"
-    "AuraDefinitionBundle"
-    "AuthProvider"
     "AutoResponseRule"
     "AutoResponseRules"
-    "BrandingSet"
-    "BusinessProcess"
-    "CMSConnectSource"
-    "CallCenter"
-    "CaseSubjectParticle"
-    "Certificate"
-    "ChannelLayout"
-    "ChatterExtension"
-    "CleanDataService"
-    "Community"
-    "CommunityTemplateDefinition"
-    "CommunityThemeDefinition"
-    "CompactLayout"
-    "ConnectedApp"
-    "ContentAsset"
-    "CorsWhitelistOrigin"
-    "CspTrustedSite"
-    "CustomApplication"
-    "CustomApplicationComponent"
-    "CustomFeedFilter"
-    "CustomField"
-    "CustomLabel"
-    "CustomLabels"
-    "CustomMetadata"
-    "CustomObject"
-    "CustomObjectTranslation"
-    "CustomPageWebLink"
-    "CustomPermission"
-    "CustomSite"
-    "CustomTab"
-    "Dashboard"
-    "DataCategoryGroup"
-    "DelegateGroup"
-    "Document"
-    "DuplicateRule"
-    "EclairGeoData"
-    "EmailServicesFunction"
-    "EmailTemplate"
-    "EmbeddedServiceBranding"
-    "EmbeddedServiceConfig"
-    "EmbeddedServiceFieldService"
     "EscalationRule"
     "EscalationRules"
-    "EventDelivery"
-    "EventSubscription"
-    "ExternalDataSource"
-    "ExternalServiceRegistration"
-    "FieldSet"
-    "FlexiPage"
     "Flow"
     "FlowCategory"
     "FlowDefinition"
-    "GlobalValueSet"
-    "GlobalValueSetTranslation"
-    "Group"
-    "HomePageComponent"
-    "HomePageLayout"
-    "Index"
-    "InstalledPackage"
-    "Layout"
-    "LeadConvertSettings"
-    "Letterhead"
-    "LightningBolt"
-    "LightningComponentBundle"
-    "LightningExperienceTheme"
-    "ListView"
-    "MatchingRule"
-    "MatchingRules"
-    "ModerationRule"
-    "NamedCredential"
-    "Network"
-    "NetworkBranding"
-    "PathAssistant"
-    "PermissionSet"
-    "PlatformCachePartition"
-    "PostTemplate"
-    "Profile"
-    "ProfilePasswordPolicy"
-    "ProfileSessionSetting"
-    "Queue"
-    "QuickAction"
-    "RecordType"
-    "RemoteSiteSetting"
-    "Report"
-    "ReportType"
-    "Role"
-    "SamlSsoConfig"
-    "Scontrol"
-    "SharingCriteriaRule"
-    "SharingOwnerRule"
-    "SharingReason"
-    "SharingRules"
-    "SharingSet"
-    "SiteDotCom"
-    "StandardValueSet"
-    "StandardValueSetTranslation"
-    "StaticResource"
-    "SynonymDictionary"
-    "TopicsForObjects"
-    "TransactionSecurityPolicy"
-    "UserCriteria"
-    "ValidationRule"
-    "WebLink"
     "Workflow"
     "WorkflowAlert"
     "WorkflowFieldUpdate"
@@ -192,18 +90,80 @@ retrieve_metadata() {
     "WorkflowRule"
     "WorkflowSend"
     "WorkflowTask"
+
+    # ── Object model (no wildcard CustomObject — avoids managed package bloat) ─
+    # CustomField retrieves all custom fields on ALL objects including custom ones.
+    # CustomObject:Name retrieves only the named standard/known org objects.
+    "BusinessProcess"
+    "CompactLayout"
+    "CustomField"
+    "CustomLabel"
+    "CustomLabels"
+    "CustomMetadata"
+    "CustomPermission"
+    "CustomTab"
+    "DuplicateRule"
+    "FieldSet"
+    "GlobalValueSet"
+    "GlobalValueSetTranslation"
+    "ListView"
+    "MatchingRule"
+    "MatchingRules"
+    "RecordType"
+    "StandardValueSet"
+    "StandardValueSetTranslation"
+    "ValidationRule"
+    "WebLink"
+
+    # ── UI & Experience ───────────────────────────────────────────────────────
+    "AuraDefinitionBundle"
+    "FlexiPage"
+    "Layout"
+    "LightningComponentBundle"
+    "PathAssistant"
+    "QuickAction"
+
+    # ── Reporting ─────────────────────────────────────────────────────────────
+    "Dashboard"
+    "Report"
+    "ReportType"
+
+    # ── Security & Access ─────────────────────────────────────────────────────
+    "DelegateGroup"
+    "Group"
+    "PermissionSet"
+    "Profile"
+    "Queue"
+    "Role"
+    "SharingCriteriaRule"
+    "SharingOwnerRule"
+    "SharingReason"
+    "SharingRules"
+    "SharingSet"
+
+    # ── App config ────────────────────────────────────────────────────────────
+    "AppMenu"
+    "ConnectedApp"
+    "CustomApplication"
+    "DataCategoryGroup"
+    "Document"
+    "EmailTemplate"
+    "ExternalDataSource"
+    "InstalledPackage"
+    "LeadConvertSettings"
+    "NamedCredential"
+    "RemoteSiteSetting"
     "Settings"
+    "StaticResource"
   )
 
   echo "  Retrieving ${#METADATA_TYPES[@]} metadata types..."
+  echo ""
 
-  # Build --metadata flags — one per type (sf CLI does not accept comma-joined string)
+  # ── Part 1: All non-object metadata types ────────────────────────────────────
   METADATA_FLAGS=()
-  for t in "${METADATA_TYPES[@]}"; do
-    METADATA_FLAGS+=(--metadata "$t")
-  done
+  for t in "${METADATA_TYPES[@]}"; do METADATA_FLAGS+=(--metadata "$t"); done
 
-  # Use if/else so set -e doesn't abort on partial retrieve failures
   if ! sf project retrieve start \
     --target-org "$ALIAS" \
     "${METADATA_FLAGS[@]}" \
@@ -213,7 +173,120 @@ retrieve_metadata() {
     echo "  ⚠  Some metadata types unavailable — continuing with what was retrieved."
   fi
 
+  normalize_paths() {
+    if [ -d "$OUTPUT_DIR/main/default" ]; then
+      bash -c "shopt -s dotglob && mv \"$OUTPUT_DIR/main/default/\"* \"$OUTPUT_DIR/\" 2>/dev/null; true"
+      rmdir "$OUTPUT_DIR/main/default" 2>/dev/null || true
+      rmdir "$OUTPUT_DIR/main"         2>/dev/null || true
+    fi
+  }
+  normalize_paths
+
+  # ── Part 2: Standard + CPQ objects ───────────────────────────────────────────
+  echo ""
+  echo "  Part 2 — Standard + CPQ objects..."
+  STANDARD_AND_CPQ_FLAGS=(
+    --metadata "CustomObject:Account"
+    --metadata "CustomObject:Case"
+    --metadata "CustomObject:Contact"
+    --metadata "CustomObject:Contract"
+    --metadata "CustomObject:Lead"
+    --metadata "CustomObject:Opportunity"
+    --metadata "CustomObject:OpportunityLineItem"
+    --metadata "CustomObject:Order"
+    --metadata "CustomObject:OrderItem"
+    --metadata "CustomObject:PricebookEntry"
+    --metadata "CustomObject:Product2"
+    --metadata "CustomObject:Task"
+    --metadata "CustomObject:SBQQ__Quote__c"
+    --metadata "CustomObject:SBQQ__QuoteLine__c"
+    --metadata "CustomObject:SBQQ__Subscription__c"
+    --metadata "CustomObject:SBQQ__PriceRule__c"
+    --metadata "CustomObject:SBQQ__PriceCondition__c"
+    --metadata "CustomObject:SBQQ__PriceAction__c"
+    --metadata "CustomObject:SBQQ__SummaryVariable__c"
+    --metadata "CustomObject:SBQQ__ProductRule__c"
+    --metadata "CustomObject:SBQQ__ErrorCondition__c"
+    --metadata "CustomObject:SBQQ__LookupQuery__c"
+    --metadata "CustomObject:SBQQ__LookupData__c"
+    --metadata "CustomObject:SBQQ__CustomAction__c"
+    --metadata "CustomObject:SBQQ__ConfigurationAttribute__c"
+    --metadata "CustomObject:SBQQ__ProductOption__c"
+    --metadata "CustomObject:SBQQ__GeneralSettings__c"
+  )
+
+  if ! sf project retrieve start \
+    --target-org "$ALIAS" \
+    "${STANDARD_AND_CPQ_FLAGS[@]}" \
+    --output-dir "$OUTPUT_DIR" \
+    --ignore-conflicts \
+    2>&1 | tee -a /tmp/retrieve-meta-log.txt; then
+    echo "  ⚠  Some standard/CPQ objects unavailable — continuing."
+  fi
+  normalize_paths
+
+  # ── Part 3: Org-specific custom objects (no namespace prefix) ─────────────────
+  echo ""
+  echo "  Part 3 — Discovering org-specific custom objects..."
+  ORG_CUSTOM_OBJECTS=$(sf data query \
+    --query "SELECT QualifiedApiName FROM EntityDefinition WHERE IsCustomizable = true AND QualifiedApiName LIKE '%__c' AND NamespacePrefix = null ORDER BY QualifiedApiName" \
+    --target-org "$ALIAS" \
+    --json 2>/dev/null | python3 -c "
+import sys, json
+d = json.load(sys.stdin)
+records = d.get('result', {}).get('records', [])
+print('\n'.join(r['QualifiedApiName'] for r in records))
+" 2>/dev/null || echo "")
+
+  if [ -n "$ORG_CUSTOM_OBJECTS" ]; then
+    ORG_OBJ_FLAGS=()
+    while IFS= read -r obj; do
+      [ -n "$obj" ] && ORG_OBJ_FLAGS+=(--metadata "CustomObject:$obj")
+    done <<< "$ORG_CUSTOM_OBJECTS"
+    echo "  Found ${#ORG_OBJ_FLAGS[@]} org-specific custom objects — retrieving..."
+    if ! sf project retrieve start \
+      --target-org "$ALIAS" \
+      "${ORG_OBJ_FLAGS[@]}" \
+      --output-dir "$OUTPUT_DIR" \
+      --ignore-conflicts \
+      2>&1 | tee -a /tmp/retrieve-meta-log.txt; then
+      echo "  ⚠  Some org custom objects unavailable — continuing."
+    fi
+    normalize_paths
+  else
+    echo "  No org-specific custom objects found or query failed."
+  fi
+
   echo "$(date -u '+%Y-%m-%d %H:%M:%S UTC') from $ALIAS" > "$TIMESTAMP_FILE"
+
+  # ── Post-retrieval cleanup ────────────────────────────────────────────────────
+  # Remove empty stub files that Salesforce returns for unused bundle components
+  # (e.g. blank Aura CSS, empty design/helper scaffolding, zero-byte data files).
+  # Also prune any empty directories left behind.
+  echo ""
+  echo "  Cleaning up empty stubs..."
+  stub_count=0
+  while IFS= read -r f; do
+    # Skip the timestamp file itself
+    [[ "$f" == *".retrieved_at" ]] && continue
+    size=$(wc -c < "$f" | tr -d ' ')
+    # Empty (0 bytes) or pure boilerplate stubs ≤ 45 bytes:
+    #   {}                          → 2  bytes  (empty JSON networkBranding)
+    #   .THIS {\n}                  → 9  bytes  (blank Aura CSS)
+    #   <design:component>\n\t\n</design:component>  → 40 bytes
+    #   ({ helperMethod: ... })     → 40 bytes  (empty Aura helper)
+    #   ({ renderIcon: ... })       → 40 bytes  (empty svgIcon controller)
+    if [ "$size" -le 45 ]; then
+      rm -f "$f"
+      stub_count=$((stub_count + 1))
+    fi
+  done < <(find "$OUTPUT_DIR" -type f -not -name ".retrieved_at")
+
+  # Remove empty directories (run twice to catch nested empties)
+  find "$OUTPUT_DIR" -empty -type d -delete 2>/dev/null || true
+  find "$OUTPUT_DIR" -empty -type d -delete 2>/dev/null || true
+
+  [ "$stub_count" -gt 0 ] && echo "    Removed $stub_count empty stub file(s)" || echo "    No stubs found"
 
   echo ""
   echo "  Metadata summary:"
@@ -296,10 +369,14 @@ retrieve_cpq_data() {
     local candidates=("$@")
     local valid_fields="Id Name"
 
+    # Build a properly quoted IN list: 'Field1','Field2','Field3'
+    local in_list
+    in_list=$(printf "'%s'," "${candidates[@]}" | sed 's/,$//')
+
     # Get field list from EntityDefinition via sf data query
     local describe_result
     describe_result=$(sf data query \
-      --query "SELECT QualifiedApiName FROM FieldDefinition WHERE EntityDefinition.QualifiedApiName = '$obj' AND QualifiedApiName IN ('$(IFS="','"; echo "${candidates[*]}")')" \
+      --query "SELECT QualifiedApiName FROM FieldDefinition WHERE EntityDefinition.QualifiedApiName = '${obj}' AND QualifiedApiName IN (${in_list})" \
       --target-org "$ALIAS" \
       --json 2>/dev/null || echo '{"result":{"records":[]}}')
 
@@ -382,10 +459,6 @@ print(' '.join(fields))
   echo ""
   echo "  [ Price Rules ]"
 
-  # Always-safe: COUNT only
-  export_query "Price Rules (count)" "price-rules-count.json" \
-    "SELECT COUNT() FROM SBQQ__PriceRule__c"
-
   export_query_safe \
     "Price Rules" \
     "price-rules.json" \
@@ -436,9 +509,6 @@ print(' '.join(fields))
   echo ""
   echo "  [ Summary Variables ]"
 
-  export_query "Summary Variables (count)" "summary-variables-count.json" \
-    "SELECT COUNT() FROM SBQQ__SummaryVariable__c"
-
   export_query_safe \
     "Summary Variables" \
     "summary-variables.json" \
@@ -457,9 +527,6 @@ print(' '.join(fields))
   # ── Product Rules ─────────────────────────────────────────────────────────────
   echo ""
   echo "  [ Product Rules ]"
-
-  export_query "Product Rules (count)" "product-rules-count.json" \
-    "SELECT COUNT() FROM SBQQ__ProductRule__c"
 
   export_query_safe \
     "Product Rules" \
@@ -504,9 +571,6 @@ print(' '.join(fields))
   echo ""
   echo "  [ Custom Scripts & Actions ]"
 
-  export_query "Custom Scripts (count)" "custom-scripts-count.json" \
-    "SELECT COUNT() FROM SBQQ__CustomScript__c"
-
   export_query_safe \
     "Custom Scripts" \
     "custom-scripts.json" \
@@ -540,6 +604,57 @@ print(' '.join(fields))
     SBQQ__FilterOperator__c \
     SBQQ__FilterValue__c \
     SBQQ__Index__c
+
+  # ── Approval Rules ────────────────────────────────────────────────────────────
+  echo ""
+  echo "  [ Approval Rules ]"
+
+  export_query_safe \
+    "Approval Rules" \
+    "approval-rules.json" \
+    "SBQQ__ApprovalRule__c" \
+    "" "SBQQ__StepNumber__c" "LIMIT 500" \
+    SBQQ__Active__c \
+    SBQQ__ConditionsMet__c \
+    SBQQ__EvaluationEvent__c \
+    SBQQ__StepNumber__c \
+    SBQQ__ApprovalStep__c \
+    SBQQ__TargetObject__c \
+    SBQQ__ApproverField__c \
+    SBQQ__ApproverUser__c \
+    SBQQ__ApproverGroup__c \
+    SBQQ__Approver__c \
+    SBQQ__RejectBehavior__c \
+    LastModifiedDate
+
+  export_query_safe \
+    "Approval Conditions" \
+    "approval-conditions.json" \
+    "SBQQ__ApprovalCondition__c" \
+    "" "" "LIMIT 2000" \
+    SBQQ__Rule__c \
+    SBQQ__TestedField__c \
+    SBQQ__Operator__c \
+    SBQQ__FilterValue__c \
+    SBQQ__FilterType__c \
+    SBQQ__FilterFormula__c \
+    SBQQ__Index__c \
+    SBQQ__Object__c \
+    SBQQ__Variable__c
+
+  export_query_safe \
+    "Approval Variables" \
+    "approval-variables.json" \
+    "SBQQ__ApprovalVariable__c" \
+    "" "Name" "LIMIT 500" \
+    SBQQ__TargetField__c \
+    SBQQ__Object__c \
+    SBQQ__FilterField__c \
+    SBQQ__FilterOperator__c \
+    SBQQ__FilterValue__c \
+    SBQQ__Type__c \
+    SBQQ__ConditionsMet__c \
+    SBQQ__FilterFormula__c
 
   # ── Lookup Tables ─────────────────────────────────────────────────────────────
   echo ""
@@ -743,28 +858,76 @@ print(' '.join(fields))
   fi
 
   # ── Reports & Dashboards ──────────────────────────────────────────────────────
-  # These use only standard fields — always safe
   echo ""
   echo "  [ Reports & Dashboards ]"
 
-  # All reports — full list for name/folder/description matching in index
+  # All reports — standard API, ordered by popularity (LastRunDate DESC).
+  # Column/filter field data is NOT available via SOQL (Tooling API bulk Report query
+  # does not support the Metadata compound field). Use the Analytics REST API
+  # describe endpoint (/services/data/vXX.0/analytics/reports/{id}/describe)
+  # for per-report column detail — see retrieve_report_columns() below.
   export_query \
     "All reports" \
     "reports-all.json" \
     "SELECT Id, Name, DeveloperName, FolderName, Format, Description, LastRunDate
      FROM Report
-     ORDER BY Name
+     ORDER BY LastRunDate DESC NULLS LAST
      LIMIT 2000"
 
-  # Reports run recently — used to enrich LastRunDate in index
-  export_query \
-    "Reports run in last 90 days" \
-    "reports-active.json" \
-    "SELECT Id, Name, DeveloperName, LastRunDate, FolderName, Format
-     FROM Report
-     WHERE LastRunDate > LAST_N_DAYS:90
-     ORDER BY LastRunDate DESC
-     LIMIT 500"
+  # Report column describe — Analytics REST API (per-report, top 200 most recently run).
+  # Produces reports-describe.json: array of {id, name, columns, groupings, filters}.
+  # Used by index.py to populate the fields[] and filter_values[] in reports-index.json.
+  echo ""
+  printf "  %-50s" "Report column describe (Analytics API, top 200)..."
+  INSTANCE_URL=$(sf org display --target-org "$ALIAS" --json 2>/dev/null \
+    | python3 -c "import sys,json; print(json.load(sys.stdin).get('result',{}).get('instanceUrl',''))" 2>/dev/null)
+  ACCESS_TOKEN=$(sf org display --target-org "$ALIAS" --json 2>/dev/null \
+    | python3 -c "import sys,json; print(json.load(sys.stdin).get('result',{}).get('accessToken',''))" 2>/dev/null)
+
+  if [ -n "$INSTANCE_URL" ] && [ -n "$ACCESS_TOKEN" ]; then
+    python3 - <<'PYEOF' "$DATA_DIR/reports-all.json" "$DATA_DIR/reports-describe.json" "$INSTANCE_URL" "$ACCESS_TOKEN"
+import sys, json, urllib.request, urllib.error
+
+reports_file, out_file, instance_url, token = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+reports = json.load(open(reports_file))
+# Top 200 most recently run (file is already ordered by LastRunDate DESC)
+top = [r for r in reports if r.get('LastRunDate')][:200]
+
+results = []
+ok = 0
+for r in top:
+    rid = r['Id']
+    url = f"{instance_url}/services/data/v62.0/analytics/reports/{rid}/describe"
+    req = urllib.request.Request(url, headers={"Authorization": f"Bearer {token}"})
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            d = json.loads(resp.read())
+        rm = d.get('reportMetadata', {})
+        cols     = rm.get('detailColumns', [])
+        grp_down = [g.get('name', '') for g in rm.get('groupingsDown', [])]
+        grp_acr  = [g.get('name', '') for g in rm.get('groupingsAcross', [])]
+        filters  = [{'column': f.get('column', ''), 'value': f.get('value', '')}
+                    for f in rm.get('reportFilters', [])]
+        results.append({
+            'id':       rid,
+            'name':     r['Name'],
+            'columns':  cols,
+            'groupings': grp_down + grp_acr,
+            'filters':  filters,
+        })
+        ok += 1
+    except Exception:
+        pass  # skip inaccessible reports silently
+
+json.dump(results, open(out_file, 'w'), indent=2)
+print(f"OK:{ok}/{len(top)}")
+PYEOF
+    describe_result=$?
+    echo " done"
+  else
+    echo '[]' > "$DATA_DIR/reports-describe.json"
+    echo " skipped (could not obtain access token)"
+  fi
 
   # All dashboards with description
   export_query \

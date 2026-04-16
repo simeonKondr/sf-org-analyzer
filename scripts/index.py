@@ -3,7 +3,7 @@
 index.py — Build cache indexes for metadata and CPQ field usage.
 
 Produces:
-  cache/manifest.json                 — counts + timestamps
+  cache/manifest.json                 — counts + timestamps + index_script_hash
   cache/fields-index.tsv              — all custom fields across all objects
   cache/flows-index.json              — Flows: writes, conditions, trigger object/event
   cache/apex-index.json               — Apex: reads, writes, SOQL objects, methods
@@ -14,12 +14,16 @@ Produces:
   cache/field-usage-index.json        — reverse map: field → all files using it (all types)
   cache/constants-index.json          — string constants from Apex + Flows
   cache/cpq-field-usage-index.json    — CPQ parent-child: rule → fields used in conditions/actions
+  cache/email-templates-index.json    — Email templates: subject, merge fields, string constants
+  cache/permission-sets-index.json    — Permission sets + profiles: field-level security
+  cache/formula-deps-index.json       — Formula fields: upstream __c field references
 
 Run: python3 scripts/index.py
 Called automatically by: bash scripts/retrieve.sh (at end of Phase 1)
 """
 
 import datetime
+import hashlib
 import json
 import re
 from pathlib import Path
@@ -35,6 +39,17 @@ def tag(name):
 def txt(el, name, default=""):
     found = el.findtext(tag(name))
     return (found or default).strip()
+
+def compact_dict(obj):
+    """Recursively strip None, empty string, empty list, and empty dict values."""
+    if isinstance(obj, dict):
+        return {k: compact_dict(v) for k, v in obj.items()
+                if v is not None and v != "" and v != [] and v != {}}
+    if isinstance(obj, list):
+        out = [compact_dict(item) for item in obj]
+        return [item for item in out
+                if item is not None and item != "" and item != [] and item != {}]
+    return obj
 
 # ─── Fields index ────────────────────────────────────────────────────────────
 
@@ -52,6 +67,11 @@ def build_fields_index():
             label   = txt(root, "label")
             formula = txt(root, "formula").replace("\n", " ")[:100]
             desc    = txt(root, "description").replace("\n", " ")[:150]
+            # Propagate label-based deprecation into desc so downstream detection fires.
+            # Salesforce marks fields deprecated via the label (e.g. "Opportunity Product Pillar (Deprecated)")
+            # rather than the description field, so we merge the signal here.
+            if "(deprecated)" in label.lower() and "deprecated" not in desc.lower():
+                desc = ("[Deprecated per field label] " + desc).strip()
         except ET.ParseError:
             ftype = label = formula = desc = ""
         rows.append(f"{obj_name}\t{field_name}\t{ftype}\t{label}\t{formula}\t{desc}")
@@ -71,14 +91,32 @@ def build_flows_index():
         ptype  = txt(root, "processType")
         status = txt(root, "status")
 
-        # Trigger object + event
+        # Trigger object + event + entry criteria filters
         trigger_obj, trigger_event = "", ""
+        entry_conds = []
         start = root.find(tag("start"))
         if start is not None:
             trigger_obj   = txt(start, "object")
             trigger_event = txt(start, "triggerType")
             if not trigger_event:
                 trigger_event = txt(start, "scheduledPaths") and "Scheduled"
+            # Entry criteria: <filters> inside <start> gate when the flow fires
+            for filt in start.findall(tag("filters")):
+                field = (filt.findtext(tag("field")) or "").strip()
+                op    = (filt.findtext(tag("operator")) or "").strip()
+                val_el = filt.find(tag("value"))
+                val = ""
+                if val_el is not None:
+                    val = (val_el.findtext(tag("stringValue"))  or
+                           val_el.findtext(tag("numberValue"))  or
+                           val_el.findtext(tag("booleanValue")) or "").strip()
+                if field:
+                    entry_conds.append(f"{field} {op} {val}".strip())
+            # filterFormula entry condition (used instead of discrete <filters>)
+            # e.g. OR(ISNEW(), ISCHANGED({!$Record.SomeField__c}))
+            filter_formula = txt(start, "filterFormula")
+            if filter_formula:
+                entry_conds.append(f"filterFormula: {filter_formula[:200]}")
 
         # Field writes: <assignToReference> that contain __c
         writes = []
@@ -87,26 +125,75 @@ def build_flows_index():
             if "__c" in v and v not in writes:
                 writes.append(v)
 
-        # Conditions (decision rules) referencing __c fields
+        # Conditions (decision rules) — capture left-hand field + operator + right-hand value.
+        # <rightValue> is a wrapper element; stringValue/numberValue/elementReference live inside it.
         conditions = []
         for cond in root.findall(f".//{tag('conditions')}"):
             lref = (cond.findtext(tag("leftValueReference")) or "").strip()
             op   = (cond.findtext(tag("operator"))           or "").strip()
-            rval = (cond.findtext(tag("stringValue")) or
-                    cond.findtext(tag("numberValue"))  or
-                    cond.findtext(tag("elementReference")) or "").strip()
+            rv   = cond.find(tag("rightValue"))
+            if rv is not None:
+                rval = (rv.findtext(tag("stringValue"))     or
+                        rv.findtext(tag("numberValue"))     or
+                        rv.findtext(tag("elementReference")) or "").strip()
+            else:
+                rval = ""
             if lref:
                 conditions.append(f"{lref} {op} {rval}".strip())
 
+        # Assignment values: string constants being written to fields.
+        # Captures "Field__c = 'SomeValue'" so VALUE_PATTERN searches work on assignments.
+        assign_values = []
+        for item in root.findall(f".//{tag('assignmentItems')}"):
+            target = (item.findtext(tag("assignToReference")) or "").strip()
+            val_el = item.find(tag("value"))
+            if val_el is not None:
+                val = (val_el.findtext(tag("stringValue")) or "").strip()
+                if val and target:
+                    entry = f"{target} = {val}"
+                    if entry not in assign_values:
+                        assign_values.append(entry)
+
+        # Formula resource expressions: named formulas defined within the flow.
+        # Captures e.g. "LowerIndustryAccount: LOWER({!Account_Record.Industry__c})"
+        formula_exprs = []
+        for fmla in root.findall(f".//{tag('formulas')}"):
+            fname_el = (fmla.findtext(tag("name"))       or "").strip()
+            expr     = (fmla.findtext(tag("expression")) or "").strip()
+            if fname_el and expr:
+                formula_exprs.append(f"{fname_el}: {expr[:200]}")
+
+        # Screen/template field reads: {!Var.Field__c} references in rich text and Slack templates.
+        # Covers <fieldText> in screen components and <text> in textTemplates.
+        screen_refs = []
+        _field_ref_re = re.compile(r'\{![^}]*\.([\w]+__c)\}')
+        for el_tag in (tag("fieldText"), tag("text")):
+            for el in root.findall(f".//{el_tag}"):
+                for field in _field_ref_re.findall(el.text or ""):
+                    if field not in screen_refs:
+                        screen_refs.append(field)
+
+        # Sub-flow callouts: which flows does this flow invoke as sub-flows?
+        subflows_called = []
+        for sf in root.findall(f".//{tag('subflows')}"):
+            sfname = (sf.findtext(tag("flowName")) or "").strip()
+            if sfname and sfname not in subflows_called:
+                subflows_called.append(sfname)
+
         flows.append({
-            "file":    f.name,
-            "label":   label,
-            "type":    ptype,
-            "status":  status,
-            "obj":     trigger_obj,
-            "event":   trigger_event,
-            "writes":  writes[:25],
-            "conds":   conditions[:10],
+            "file":          f.name,
+            "label":         label,
+            "type":          ptype,
+            "status":        status,
+            "obj":           trigger_obj,
+            "event":         trigger_event,
+            "writes":        writes,
+            "entry_conds":   entry_conds,
+            "conds":         conditions,
+            "assign_values": assign_values,
+            "formulas":      formula_exprs,
+            "screen_refs":   screen_refs,
+            "subflows":      subflows_called,
         })
     return flows
 
@@ -130,28 +217,37 @@ def build_apex_index():
             src
         )
         methods = [m for m in methods
-                   if m not in ("if","for","while","catch","new","return")][:20]
+                   if m not in ("if","for","while","catch","new","return")]
 
         # Field writes: anything.Field__c = (excludes == comparisons)
         writes = list(dict.fromkeys(
             re.findall(r'[\w]+\.([\w]+__c)\s*[+\-]?=(?!=)', src)
-        ))[:20]
+        ))
 
         # Field reads: .Field__c references that are not assignments
         all_refs = re.findall(r'[\w]+\.([\w]+__c)', src)
-        reads = list(dict.fromkeys([r for r in all_refs if r not in writes]))[:20]
+        reads = list(dict.fromkeys([r for r in all_refs if r not in writes]))
 
         # SOQL FROM objects
         soql_from = list(dict.fromkeys(
             re.findall(r'\bFROM\s+(\w+)', src, re.IGNORECASE)
-        ))[:10]
+        ))
+
+        # Cross-object standard field references: e.g. SBQQ__Product__r.Family
+        # The __c-only regex misses standard fields accessed via relationship traversal.
+        # Exclude custom fields (__c) and relationship names (__r) — not actual field reads.
+        cross_obj_reads = list(dict.fromkeys(
+            f for f in re.findall(r'\b\w+__r\.([A-Za-z][A-Za-z0-9_]*)\b', src)
+            if not f.endswith('__c') and not f.endswith('__r')
+        ))
 
         classes.append({
-            "file":      f.name,
-            "methods":   methods,
-            "reads":     reads,
-            "writes":    writes,
-            "soql_from": soql_from,
+            "file":           f.name,
+            "methods":        methods,
+            "reads":          reads,
+            "writes":         writes,
+            "soql_from":      soql_from,
+            "cross_obj_reads": cross_obj_reads,
         })
     return classes
 
@@ -178,30 +274,38 @@ def build_triggers_index():
         # Field writes: anything.Field__c = (excludes == comparisons)
         writes = list(dict.fromkeys(
             re.findall(r'[\w]+\.([\w]+__c)\s*[+\-]?=(?!=)', src)
-        ))[:20]
+        ))
 
         # Field reads (simple pattern: .Field__c references)
         all_refs = re.findall(r'\.([\w]+__c)', src)
-        reads = list(dict.fromkeys([r for r in all_refs if r not in writes]))[:20]
+        reads = list(dict.fromkeys([r for r in all_refs if r not in writes]))
 
         # SOQL FROM objects
         soql_from = list(dict.fromkeys(
             re.findall(r'\bFROM\s+(\w+)', src, re.IGNORECASE)
-        ))[:10]
+        ))
+
+        # Cross-object standard field references (same as Apex)
+        # Exclude custom fields (__c) and relationship names (__r) — not actual field reads.
+        cross_obj_reads = list(dict.fromkeys(
+            f for f in re.findall(r'\b\w+__r\.([A-Za-z][A-Za-z0-9_]*)\b', src)
+            if not f.endswith('__c') and not f.endswith('__r')
+        ))
 
         # String constants (quoted strings with meaningful content)
         strings = re.findall(r'["\']([^"\']{3,})["\']', src)
-        constants = list(set([s for s in strings 
-                             if any(c.isupper() or c == '_' for c in s) and len(s) > 3]))[:15]
+        constants = list(set([s for s in strings
+                             if any(c.isupper() or c == '_' for c in s) and len(s) > 3]))
 
         triggers.append({
-            "file":      f.name,
-            "name":      tname,
-            "object":    obj,
-            "events":    events,
-            "reads":     reads,
-            "writes":    writes,
-            "soql_from": soql_from,
+            "file":           f.name,
+            "name":           tname,
+            "object":         obj,
+            "events":         events,
+            "reads":          reads,
+            "writes":         writes,
+            "soql_from":      soql_from,
+            "cross_obj_reads": cross_obj_reads,
             "constants": constants,
         })
     return triggers
@@ -234,6 +338,18 @@ def build_field_usage_index(flows, apex_classes, triggers):
             fields_in_cond = re.findall(r'\b([a-zA-Z_][a-zA-Z0-9_]*__c)\b', cond)
             for field in fields_in_cond:
                 add_usage(field, fname, "Flow", "condition", cond[:80])
+        for cond in flow.get("entry_conds", []):
+            fields_in_cond = re.findall(r'\b([a-zA-Z_][a-zA-Z0-9_]*__c)\b', cond)
+            for field in fields_in_cond:
+                add_usage(field, fname, "Flow", "entry_condition", cond[:80])
+        # Index assignment target fields from assign_values (field = value pairs)
+        for av in flow.get("assign_values", []):
+            fields_in_av = re.findall(r'\b([a-zA-Z_][a-zA-Z0-9_]*__c)\b', av)
+            for field in fields_in_av:
+                add_usage(field, fname, "Flow", "assign", av[:80])
+        # Index field references from screen displays and text templates (read-only)
+        for field in flow.get("screen_refs", []):
+            add_usage(field, fname, "Flow", "screen_read", flabel)
 
     # From Apex
     for cls in apex_classes:
@@ -243,6 +359,9 @@ def build_field_usage_index(flows, apex_classes, triggers):
             add_usage(field, fname, "Apex", "write", cname)
         for field in cls.get("reads", []):
             add_usage(field, fname, "Apex", "read", cname)
+        # Cross-object standard field reads (e.g. SBQQ__Product__r.Family)
+        for field in cls.get("cross_obj_reads", []):
+            add_usage(field, fname, "Apex", "cross_obj_read", cname)
 
     # From Triggers
     for trig in triggers:
@@ -253,6 +372,8 @@ def build_field_usage_index(flows, apex_classes, triggers):
             add_usage(field, fname, "Trigger", "write", f"{tname}({events})")
         for field in trig.get("reads", []):
             add_usage(field, fname, "Trigger", "read", f"{tname}({events})")
+        for field in trig.get("cross_obj_reads", []):
+            add_usage(field, fname, "Trigger", "cross_obj_read", f"{tname}({events})")
 
     return usage
 
@@ -271,11 +392,11 @@ def build_constants_index():
         except Exception:
             continue
 
-        # Extract quoted strings (length > 3)
-        strings = re.findall(r'["\']([^"\']{3,})["\']', code)
+        # Extract quoted strings (length 3–120, single line only)
+        strings = re.findall(r'["\']([^"\']{3,120})["\']', code)
         for s in strings:
-            # Filter for meaningful constants (contain uppercase or underscores)
-            if any(c.isupper() or c == '_' for c in s) and not s.isdigit():
+            # Filter for meaningful constants (contain uppercase or underscores, no newlines)
+            if '\n' not in s and any(c.isupper() or c == '_' for c in s) and not s.isdigit():
                 if s not in constants:
                     constants[s] = []
                 constants[s].append({
@@ -441,14 +562,19 @@ def build_workflow_rules_index():
 
 def build_reports_index():
     """
-    Built from SOQL-exported data (reports-all.json + reports-active.json).
+    Built from SOQL-exported data (reports-all.json).
 
-    Report XML is NOT reliably retrievable via the Metadata API — the sf CLI
-    retrieves reportTypes but not report definitions. This function reads the
-    exported JSON instead.
+    reports-all.json is fetched via the Tooling API during retrieval and includes
+    a Metadata compound field per report.  When Metadata is present this function
+    extracts column fields, filter fields, and filter values so reports can be
+    found by the fields they use.  Falls back to name/folder/description matching
+    when Metadata is absent (standard-API fallback path).
 
-    Matching is name/folder/description based. For column-level field analysis
-    use /runtime with the Analytics REST API or name-pattern SOQL.
+    Each entry in the returned list:
+      id, name, dev_name, folder, format, last_run, description,
+      fields        — column + grouping + filter field API names (sorted, deduplicated)
+      filter_values — values from filter criteria items
+      searchable    — lowercase join of all matching surfaces
     """
     cpq_dir = Path("data/cpq")
 
@@ -462,8 +588,57 @@ def build_reports_index():
         except Exception:
             return []
 
-    # reports-active.json has accurate LastRunDate — use it to enrich reports-all
-    active_by_id = {r["Id"]: r for r in load("reports-active.json") if r.get("Id")}
+    def parse_describe(desc_record):
+        """
+        Extract normalised field names and filter values from one Analytics describe record.
+
+        Column/grouping names use Salesforce's report column ID format:
+          - Cross-object custom:   Opportunity.Product_Families__c
+          - Cross-object standard: ACCOUNT.NAME, OPPORTUNITY.STAGE_NAME
+          - Bare custom:           MY_FIELD__C
+        We keep the full form AND a bare-suffix form so both
+        'Product_Families__c' and 'Opportunity.Product_Families__c' match.
+
+        Returns (fields: list[str], filter_values: list[str]).
+        """
+        raw_fields = set()
+
+        for col in desc_record.get("columns") or []:
+            # Strip conversion suffix like ".CONVERT" from "Opportunity.ARR__c.CONVERT"
+            name = col.split(".CONVERT")[0].strip() if isinstance(col, str) else ""
+            if name:
+                raw_fields.add(name)
+
+        for g in desc_record.get("groupings") or []:
+            name = g.split(".CONVERT")[0].strip() if isinstance(g, str) else ""
+            if name:
+                raw_fields.add(name)
+
+        filter_values = []
+        for f in desc_record.get("filters") or []:
+            col = (f.get("column") or "").split(".CONVERT")[0].strip()
+            val = (f.get("value") or "").strip()
+            if col:
+                raw_fields.add(col)
+            if val:
+                filter_values.append(val)
+
+        # Build normalised set: keep original + bare suffix (after last dot)
+        normalised = set()
+        for f in raw_fields:
+            normalised.add(f)
+            suffix = f.split(".")[-1]
+            if suffix != f:
+                normalised.add(suffix)
+
+        return sorted(normalised), filter_values
+
+    # Load Analytics describe enrichment (reports-describe.json produced by retrieve.sh)
+    describe_by_id = {}
+    for d in load("reports-describe.json"):
+        rid = d.get("id")
+        if rid:
+            describe_by_id[rid] = d
 
     reports = []
     for r in load("reports-all.json"):
@@ -473,35 +648,27 @@ def build_reports_index():
         folder   = r.get("FolderName", "")
         desc     = (r.get("Description") or "").strip()
         fmt      = r.get("Format", "")
-        last_run = active_by_id.get(rid, {}).get("LastRunDate") or r.get("LastRunDate") or ""
+        last_run = r.get("LastRunDate", "")
+
+        fields, filter_values = (
+            parse_describe(describe_by_id[rid])
+            if rid in describe_by_id
+            else ([], [])
+        )
 
         reports.append({
-            "id":          rid,
-            "name":        name,
-            "dev_name":    dev_name,
-            "folder":      folder,
-            "format":      fmt,
-            "last_run":    last_run,
-            "description": desc[:200],
-            # searchable is the primary matching surface — name + folder + description
-            "searchable":  f"{name} {dev_name} {folder} {desc}".lower(),
+            "id":            rid,
+            "name":          name,
+            "dev_name":      dev_name,
+            "folder":        folder,
+            "format":        fmt,
+            "last_run":      last_run,
+            "description":   desc[:200],
+            "fields":        fields,
+            "filter_values": filter_values,
+            # searchable covers name + folder + description + all field names
+            "searchable":    " ".join([name, dev_name, folder, desc] + fields).lower(),
         })
-
-    # Fall back to reports-active.json alone if reports-all.json wasn't exported yet
-    if not reports:
-        for r in load("reports-active.json"):
-            name   = r.get("Name", "")
-            folder = r.get("FolderName", "")
-            reports.append({
-                "id":          r.get("Id", ""),
-                "name":        name,
-                "dev_name":    r.get("DeveloperName", ""),
-                "folder":      folder,
-                "format":      r.get("Format", ""),
-                "last_run":    r.get("LastRunDate", ""),
-                "description": "",
-                "searchable":  f"{name} {folder}".lower(),
-            })
 
     return reports
 
@@ -563,7 +730,8 @@ def build_cpq_field_usage_index():
     Parent-child CPQ field usage index.
 
     For each parent record (PriceRule, ProductRule, SummaryVariable, LookupQuery,
-    ConfigurationAttribute, ProductOption, SearchFilter, CustomScript) produces:
+    ConfigurationAttribute, ProductOption, SearchFilter, CustomScript,
+    ApprovalRule, ApprovalVariable) produces:
       {
         "id":     "...",
         "name":   "...",
@@ -610,6 +778,23 @@ def build_cpq_field_usage_index():
         if not formula or not isinstance(formula, str):
             return []
         return sorted(set(re.findall(r'\b([A-Za-z][A-Za-z0-9_]*__c)\b', formula)))
+
+    def extract_constants(values):
+        """Return unique non-empty string values that are not Salesforce field API names."""
+        seen = set()
+        out = []
+        for v in values:
+            if not v or not isinstance(v, str):
+                continue
+            v = v.strip()
+            if len(v) < 2:
+                continue
+            if is_field_name(v):   # skip bare field API names — already in "fields"
+                continue
+            if v not in seen:
+                seen.add(v)
+                out.append(v)
+        return out
 
     # ── Load data ─────────────────────────────────────────────────────────────
     price_rules       = load("price-rules.json")
@@ -663,11 +848,16 @@ def build_cpq_field_usage_index():
             action_out.append(entry)
 
         all_fields = sorted({e["field"] for e in cond_out + action_out if e.get("field")})
+        all_constants = extract_constants(
+            [e.get("value", "") for e in cond_out + action_out] +
+            [e.get("formula", "") for e in cond_out + action_out]
+        )
 
         pr_entries.append({
             "id":         rid,
             "name":       rname,
             "fields":     all_fields,
+            "constants":  all_constants,
             "conditions": cond_out,
             "actions":    action_out,
         })
@@ -700,11 +890,17 @@ def build_cpq_field_usage_index():
         all_fields = sorted(
             {e["field"] for e in econd_out if e.get("field")} | set(formula_fields)
         )
+        all_constants = extract_constants(
+            [e.get("value", "") for e in econd_out] +
+            [e.get("formula", "") for e in econd_out] +
+            [formula_str]
+        )
 
         prd_entries.append({
             "id":                      rid,
             "name":                    rname,
             "fields":                  all_fields,
+            "constants":               all_constants,
             "error_condition_formula": formula_str,
             "error_conditions":        econd_out,
         })
@@ -718,10 +914,16 @@ def build_cpq_field_usage_index():
         filter_fld = is_field_name(sv.get("SBQQ__FilterField__c"))
         all_fields = sorted({f for f in [target, filter_fld] if f})
 
+        sv_constants = extract_constants([
+            sv.get("SBQQ__FilterValue__c", ""),
+            sv.get("SBQQ__FilterFormula__c", ""),
+        ])
+
         sv_entries.append({
             "id":           sv.get("Id"),
             "name":         sv.get("Name", sv.get("Id")),
             "fields":       all_fields,
+            "constants":    sv_constants,
             "target_field": target or "",
             "filter": {
                 "field":    filter_fld or "",
@@ -752,10 +954,16 @@ def build_cpq_field_usage_index():
             {l["field"] for l in line_out if l.get("field")}
         )
 
+        lq_constants = extract_constants(
+            [l.get("value", "") for l in line_out] +
+            [lq.get("SBQQ__Query__c", "")]
+        )
+
         lq_entries.append({
             "id":           lq_id,
             "name":         lq.get("Name", lq_id),
             "fields":       all_fields,
+            "constants":    lq_constants,
             "value_field":  vfield or "",
             "lookup_field": lfield or "",
             "query":        lq.get("SBQQ__Query__c", ""),
@@ -768,10 +976,13 @@ def build_cpq_field_usage_index():
     ca_entries = []
     for ca in config_attrs:
         target = is_field_name(ca.get("SBQQ__TargetField__c"))
+        ca_constants = extract_constants([ca.get("SBQQ__DefaultValue__c", "")])
+
         ca_entries.append({
             "id":            ca.get("Id"),
             "name":          ca.get("Name", ca.get("Id")),
             "fields":        [target] if target else [],
+            "constants":     ca_constants,
             "target_field":  target or "",
             "default_value": ca.get("SBQQ__DefaultValue__c", ""),
             "hidden":        ca.get("SBQQ__Hidden__c"),
@@ -798,10 +1009,13 @@ def build_cpq_field_usage_index():
     sf_entries = []
     for sf in search_filters:
         field = is_field_name(sf.get("SBQQ__Field__c"))
+        sf_constants = extract_constants([sf.get("SBQQ__Value__c", "")])
+
         sf_entries.append({
             "id":       sf.get("Id"),
             "name":     sf.get("Name", sf.get("Id")),
             "fields":   [field] if field else [],
+            "constants": sf_constants,
             "field":    field or "",
             "operator": sf.get("SBQQ__Operator__c", ""),
             "value":    sf.get("SBQQ__Value__c", ""),
@@ -814,24 +1028,647 @@ def build_cpq_field_usage_index():
     for cs in custom_scripts:
         code   = cs.get("SBQQ__Code__c") or ""
         fields = fields_from_formula(code)
+        # Extract quoted string literals from JS code (length >= 3, has uppercase or underscore)
+        raw_strings = re.findall(r'["\']([^"\']{3,})["\']', code)
+        cs_constants = extract_constants(
+            [s for s in raw_strings if any(c.isupper() or c == '_' for c in s)]
+        )
         cs_entries.append({
             "id":          cs.get("Id"),
             "name":        cs.get("Name", cs.get("Id")),
             "fields":      fields,
+            "constants":   cs_constants,
             "code_length": len(code),
         })
 
     result["CustomScript"] = cs_entries
 
+    # ── Approval Rules ────────────────────────────────────────────────────────
+    approval_rules      = load("approval-rules.json")
+    approval_conditions = load("approval-conditions.json")
+    approval_variables  = load("approval-variables.json")
+
+    acond_by_rule = group_by(approval_conditions, "SBQQ__Rule__c")
+
+    # Build a lookup of variable Id → variable record for condition enrichment
+    var_by_id = {v.get("Id"): v for v in approval_variables if v.get("Id")}
+
+    ar_entries = []
+    for rule in approval_rules:
+        rid   = rule.get("Id")
+        rname = rule.get("Name", rid)
+
+        cond_out = []
+        for c in acond_by_rule.get(rid, []):
+            field = is_field_name(c.get("SBQQ__TestedField__c"))
+            # Resolve variable name if condition references a variable
+            var_id   = c.get("SBQQ__Variable__c")
+            var_name = var_by_id.get(var_id, {}).get("Name", "") if var_id else ""
+            entry = {
+                "field":    field or "",
+                "object":   c.get("SBQQ__Object__c", ""),
+                "operator": c.get("SBQQ__Operator__c", ""),
+                "value":    c.get("SBQQ__FilterValue__c", ""),
+            }
+            if c.get("SBQQ__FilterFormula__c"):
+                entry["formula"] = c["SBQQ__FilterFormula__c"]
+            if var_name:
+                entry["variable"] = var_name
+            cond_out.append(entry)
+
+        # Approver field is also a field reference
+        approver_field = is_field_name(rule.get("SBQQ__ApproverField__c"))
+
+        all_fields = sorted(
+            {e["field"] for e in cond_out if e.get("field")} |
+            ({approver_field} if approver_field else set())
+        )
+        all_constants = extract_constants(
+            [e.get("value", "") for e in cond_out] +
+            [e.get("formula", "") for e in cond_out]
+        )
+
+        ar_entries.append({
+            "id":             rid,
+            "name":           rname,
+            "active":         rule.get("SBQQ__Active__c"),
+            "step_number":    rule.get("SBQQ__StepNumber__c"),
+            "evaluation_event": rule.get("SBQQ__EvaluationEvent__c", ""),
+            "conditions_met": rule.get("SBQQ__ConditionsMet__c", ""),
+            "target_object":  rule.get("SBQQ__TargetObject__c", ""),
+            "approver_field": approver_field or "",
+            "reject_behavior": rule.get("SBQQ__RejectBehavior__c", ""),
+            "fields":         all_fields,
+            "constants":      all_constants,
+            "conditions":     cond_out,
+        })
+
+    result["ApprovalRule"] = ar_entries
+
+    # ── Approval Variables (standalone index) ─────────────────────────────────
+    av_entries = []
+    for av in approval_variables:
+        target     = is_field_name(av.get("SBQQ__TargetField__c"))
+        filter_fld = is_field_name(av.get("SBQQ__FilterField__c"))
+        all_fields = sorted({f for f in [target, filter_fld] if f})
+        av_constants = extract_constants([
+            av.get("SBQQ__FilterValue__c", ""),
+            av.get("SBQQ__FilterFormula__c", ""),
+        ])
+        av_entries.append({
+            "id":           av.get("Id"),
+            "name":         av.get("Name", av.get("Id")),
+            "fields":       all_fields,
+            "constants":    av_constants,
+            "target_field": target or "",
+            "object":       av.get("SBQQ__Object__c", ""),
+            "filter": {
+                "field":    filter_fld or "",
+                "operator": av.get("SBQQ__FilterOperator__c", ""),
+                "value":    av.get("SBQQ__FilterValue__c", ""),
+                "formula":  av.get("SBQQ__FilterFormula__c", ""),
+            },
+        })
+
+    result["ApprovalVariable"] = av_entries
+
+    # ── Inverted constants index ───────────────────────────────────────────────
+    # _constants: { "Engagement": [{"type": "PriceRule", "id": ..., "name": ...}, ...], ... }
+    # Lets analysis query "which CPQ rules reference this picklist value?"
+    inv = {}
+    for type_name, entries in result.items():
+        for entry in entries:
+            for c in entry.get("constants", []):
+                inv.setdefault(c, []).append({
+                    "type": type_name,
+                    "id":   entry.get("id"),
+                    "name": entry.get("name"),
+                })
+    result["_constants"] = inv
+
     return result
+
+
+# ─── LWC / Aura index ────────────────────────────────────────────────────────
+
+def build_ui_components_index():
+    """
+    Index LWC and Aura components for field references, Apex imports, and
+    string constants.
+
+    For LWC (.js files):
+      - @salesforce/apex/ClassName.method  → apex_imports
+      - @salesforce/schema/Object.Field__c → schema_imports
+      - .Field__c references in JS         → fields (reads)
+      - string literals                    → constants
+
+    For Aura (.cmp / controller .js files):
+      - controller="ClassName"             → apex_imports
+      - {!v.Record.Field__c} bindings      → fields
+      - .Field__c references in JS         → fields
+      - string literals                    → constants
+
+    Output per entry:
+      { "name": "...", "type": "lwc"|"aura", "files": [...],
+        "apex_imports": [...], "schema_imports": [...],
+        "fields": [...], "objects": [...], "constants": [...] }
+    """
+    components = []
+
+    # ── LWC ──────────────────────────────────────────────────────────────────
+    for comp_dir in sorted((METADATA_DIR / "lwc").iterdir()):
+        if not comp_dir.is_dir():
+            continue
+
+        apex_imports   = []
+        schema_imports = []
+        fields         = []
+        objects        = []
+        constants      = []
+        files_seen     = []
+
+        for f in sorted(comp_dir.iterdir()):
+            if f.suffix not in (".js", ".html"):
+                continue
+            try:
+                src = f.read_text(encoding="utf-8", errors="ignore")
+            except Exception:
+                continue
+            files_seen.append(f.name)
+
+            # @salesforce/apex/ClassName.methodName
+            for imp in re.findall(
+                r"from\s+['\"]@salesforce/apex/([A-Za-z0-9_.]+)['\"]", src
+            ):
+                cls = imp.split(".")[0]
+                if cls not in apex_imports:
+                    apex_imports.append(cls)
+
+            # @salesforce/schema/ObjectName.FieldName or just ObjectName
+            for imp in re.findall(
+                r"from\s+['\"]@salesforce/schema/([A-Za-z0-9_.]+)['\"]", src
+            ):
+                schema_imports.append(imp)
+                parts = imp.split(".")
+                obj = parts[0]
+                if obj not in objects:
+                    objects.append(obj)
+                if len(parts) > 1 and parts[1] not in fields:
+                    fields.append(parts[1])
+
+            # .Field__c and Field__c references in JS/HTML
+            for ref in re.findall(r'\b([A-Za-z][A-Za-z0-9_]*__c)\b', src):
+                if ref not in fields:
+                    fields.append(ref)
+
+            # String constants (meaningful: uppercase or underscore, 3–80 chars)
+            for s in re.findall(r'["\']([^"\']{3,80})["\']', src):
+                if '\n' not in s and any(c.isupper() or c == '_' for c in s):
+                    if s not in constants:
+                        constants.append(s)
+
+        if fields or apex_imports or schema_imports:
+            components.append({
+                "name":           comp_dir.name,
+                "type":           "lwc",
+                "files":          files_seen,
+                "apex_imports":   apex_imports,
+                "schema_imports": schema_imports,
+                "fields":         fields,
+                "objects":        objects,
+                "constants":      constants,
+            })
+
+    # ── Aura ─────────────────────────────────────────────────────────────────
+    for comp_dir in sorted((METADATA_DIR / "aura").iterdir()):
+        if not comp_dir.is_dir():
+            continue
+
+        apex_imports = []
+        fields       = []
+        objects      = []
+        constants    = []
+        files_seen   = []
+
+        for f in sorted(comp_dir.iterdir()):
+            if f.suffix not in (".cmp", ".js", ".app", ".evt"):
+                continue
+            try:
+                src = f.read_text(encoding="utf-8", errors="ignore")
+            except Exception:
+                continue
+            files_seen.append(f.name)
+
+            # Aura controller="ClassName" attribute
+            for cls in re.findall(r'controller\s*=\s*["\']([A-Za-z0-9_]+)["\']', src):
+                if cls not in apex_imports:
+                    apex_imports.append(cls)
+
+            # {!v.Record.Field__c} and {!v.Field__c} bindings in .cmp
+            for ref in re.findall(r'\{![^}]*\b([A-Za-z][A-Za-z0-9_]*__c)\b[^}]*\}', src):
+                if ref not in fields:
+                    fields.append(ref)
+
+            # .Field__c references in JS
+            for ref in re.findall(r'\b([A-Za-z][A-Za-z0-9_]*__c)\b', src):
+                if ref not in fields:
+                    fields.append(ref)
+
+            # String constants
+            for s in re.findall(r'["\']([^"\']{3,80})["\']', src):
+                if '\n' not in s and any(c.isupper() or c == '_' for c in s):
+                    if s not in constants:
+                        constants.append(s)
+
+        if fields or apex_imports:
+            components.append({
+                "name":         comp_dir.name,
+                "type":         "aura",
+                "files":        files_seen,
+                "apex_imports": apex_imports,
+                "fields":       fields,
+                "objects":      objects,
+                "constants":    constants,
+            })
+
+    return components
+
+
+# ─── Layouts index ───────────────────────────────────────────────────────────
+
+def build_layouts_index():
+    """
+    Per layout: list of all field API names that appear in any section.
+    Enables "which layouts show this field" queries without grepping 330 files.
+
+    Output per entry:
+      { "file": "...", "object": "...", "fields": ["Field__c", ...],
+        "sections": [{"label": "...", "fields": [...]}, ...] }
+    """
+    layouts = []
+    for f in sorted(METADATA_DIR.glob("layouts/*.layout-meta.xml")):
+        try:
+            root = ET.parse(f).getroot()
+        except ET.ParseError:
+            continue
+
+        # Derive object name from filename: "Account-Account Layout.layout-meta.xml"
+        obj_name = f.name.split("-")[0] if "-" in f.name else f.stem.replace(".layout-meta.xml", "")
+
+        sections = []
+        all_fields = []
+
+        for section in root.findall(f".//{tag('layoutSections')}"):
+            sec_label = txt(section, "label")
+            sec_fields = []
+            for item in section.findall(f".//{tag('layoutItems')}"):
+                field = txt(item, "field")
+                if field:
+                    sec_fields.append(field)
+                    if field not in all_fields:
+                        all_fields.append(field)
+            if sec_fields:
+                sections.append({"label": sec_label, "fields": sec_fields})
+
+        # Also catch fields outside layoutSections (e.g. related lists, header)
+        for item in root.findall(f".//{tag('layoutItems')}"):
+            field = txt(item, "field")
+            if field and field not in all_fields:
+                all_fields.append(field)
+
+        if all_fields:
+            layouts.append({
+                "file":     f.name,
+                "object":   obj_name,
+                "fields":   all_fields,
+                "sections": sections,
+            })
+
+    return layouts
+
+
+# ─── Custom Metadata index ────────────────────────────────────────────────────
+
+def build_custom_metadata_index():
+    """
+    Per CMDT record: the type name, record name/label, and all field→value pairs.
+    Indexed so analysis can query "which CMDT records reference pillar value X".
+
+    Output structure:
+      {
+        "TypeName": [
+          { "record": "TypeName.RecordName", "label": "...",
+            "values": { "Field__c": "value", ... } },
+          ...
+        ],
+        ...
+      }
+    """
+    by_type = {}
+    NS_XSI = "http://www.w3.org/1999/XMLSchema-instance"
+
+    for f in sorted(METADATA_DIR.glob("customMetadata/*.md-meta.xml")):
+        # Filename: TypeName.RecordName.md-meta.xml
+        parts = f.name.replace(".md-meta.xml", "").split(".", 1)
+        type_name   = parts[0] if parts else f.stem
+        record_name = parts[1] if len(parts) > 1 else ""
+
+        try:
+            root = ET.parse(f).getroot()
+        except ET.ParseError:
+            continue
+
+        label = txt(root, "label")
+        values = {}
+
+        for val_el in root.findall(tag("values")):
+            field = txt(val_el, "field")
+            # <value xsi:type="xsd:string">...</value>
+            val_el_inner = val_el.find(tag("value"))
+            value = (val_el_inner.text or "").strip() if val_el_inner is not None else ""
+            if field:
+                values[field] = value[:300]  # truncate very long text fields
+
+        if values:
+            by_type.setdefault(type_name, []).append({
+                "record": f"{type_name}.{record_name}",
+                "label":  label,
+                "values": values,
+            })
+
+    return by_type
+
+
+# ─── Quick Actions index ──────────────────────────────────────────────────────
+
+def build_quick_actions_index():
+    """
+    Per quick action: target object, action type, and field API names shown
+    in the action layout (including any with default values).
+
+    Enables "which quick actions surface this field" queries.
+
+    Output per entry:
+      { "file": "...", "object": "...", "name": "...", "type": "...",
+        "fields": ["Field__c", ...],
+        "defaults": [{"field": "Field__c", "value": "..."}, ...] }
+    """
+    actions = []
+    for f in sorted(METADATA_DIR.glob("quickActions/*.quickAction-meta.xml")):
+        try:
+            root = ET.parse(f).getroot()
+        except ET.ParseError:
+            continue
+
+        # Filename: Object.ActionName.quickAction-meta.xml
+        parts = f.name.replace(".quickAction-meta.xml", "").split(".", 1)
+        obj_name    = parts[0] if parts else ""
+        action_name = parts[1] if len(parts) > 1 else f.stem
+
+        action_type   = txt(root, "type")
+        target_object = txt(root, "targetObject") or obj_name
+
+        # Fields in the quick action layout
+        fields = []
+        for item in root.findall(f".//{tag('quickActionLayoutItems')}"):
+            field = txt(item, "field")
+            if field and field not in fields:
+                fields.append(field)
+
+        # Field default values
+        defaults = []
+        for fd in root.findall(f".//{tag('fieldOverrides')}"):
+            field = txt(fd, "field")
+            formula = txt(fd, "formula")
+            literal = txt(fd, "literalValue")
+            value = formula or literal
+            if field and value:
+                defaults.append({"field": field, "value": value[:100]})
+                if field not in fields:
+                    fields.append(field)
+
+        if fields or defaults:
+            actions.append({
+                "file":     f.name,
+                "object":   obj_name,
+                "name":     action_name,
+                "type":     action_type,
+                "target":   target_object,
+                "fields":   fields,
+                "defaults": defaults,
+            })
+
+    return actions
+
+
+# ─── Email templates index ───────────────────────────────────────────────────
+
+def build_email_templates_index():
+    """
+    Extract field refs and string constants from email templates.
+    Covers both classic (.email / .email-meta.xml) and Lightning (.emailTemplate-meta.xml).
+
+    Output per entry:
+      { "file": "...", "name": "...", "subject": "...",
+        "fields": ["Field__c", ...], "constants": [...] }
+    """
+    templates = []
+
+    # ── Classic email templates (metadata/email/**/*.email-meta.xml) ──────────
+    email_dir = METADATA_DIR / "email"
+    if email_dir.exists():
+        for meta_f in sorted(email_dir.rglob("*.email-meta.xml")):
+            try:
+                root = ET.parse(meta_f).getroot()
+            except ET.ParseError:
+                continue
+
+            subject  = txt(root, "subject")
+            name     = meta_f.name.replace(".email-meta.xml", "")
+            rel_path = str(meta_f.relative_to(METADATA_DIR))
+
+            # Body file: swap .email-meta.xml → .email
+            body_f = meta_f.with_name(name + ".email")
+            body_text = ""
+            if body_f.exists():
+                try:
+                    body_text = body_f.read_text(encoding="utf-8", errors="ignore")
+                except Exception:
+                    pass
+
+            combined = subject + " " + body_text
+
+            # Merge field refs like {!Opportunity.Product_Pillar__c}
+            merge_fields = list(dict.fromkeys(
+                re.findall(r'\{![\w.]+\.([\w]+__c)\}', combined)
+            ))
+            # Bare __c refs
+            bare_fields = list(dict.fromkeys(re.findall(r'\b([A-Za-z][A-Za-z0-9_]*__c)\b', combined)))
+            fields = list(dict.fromkeys(merge_fields + bare_fields))
+
+            constants = []
+            for s in re.findall(r'["\']([^"\']{3,120})["\']', combined):
+                if '\n' not in s and any(c.isupper() or c == '_' for c in s):
+                    if s not in constants:
+                        constants.append(s)
+
+            if subject or fields:
+                templates.append({
+                    "file":      rel_path,
+                    "name":      name,
+                    "subject":   subject[:200],
+                    "fields":    fields,
+                    "constants": constants[:30],
+                })
+
+    # ── Lightning email templates (metadata/emailTemplates/*.emailTemplate-meta.xml) ─
+    et_dir = METADATA_DIR / "emailTemplates"
+    if et_dir.exists():
+        for meta_f in sorted(et_dir.rglob("*.emailTemplate-meta.xml")):
+            try:
+                root = ET.parse(meta_f).getroot()
+            except ET.ParseError:
+                continue
+
+            subject  = txt(root, "subject")
+            name     = meta_f.name.replace(".emailTemplate-meta.xml", "")
+            rel_path = str(meta_f.relative_to(METADATA_DIR))
+
+            html_val  = txt(root, "htmlValue")
+            text_val  = txt(root, "textValue")
+            combined  = subject + " " + html_val + " " + text_val
+
+            merge_fields = list(dict.fromkeys(
+                re.findall(r'\{![\w.]+\.([\w]+__c)\}', combined)
+            ))
+            bare_fields = list(dict.fromkeys(re.findall(r'\b([A-Za-z][A-Za-z0-9_]*__c)\b', combined)))
+            fields = list(dict.fromkeys(merge_fields + bare_fields))
+
+            constants = []
+            for s in re.findall(r'["\']([^"\']{3,120})["\']', combined):
+                if '\n' not in s and any(c.isupper() or c == '_' for c in s):
+                    if s not in constants:
+                        constants.append(s)
+
+            if subject or fields:
+                templates.append({
+                    "file":      rel_path,
+                    "name":      name,
+                    "subject":   subject[:200],
+                    "fields":    fields,
+                    "constants": constants[:30],
+                })
+
+    return templates
+
+
+# ─── Permission sets + profiles index ────────────────────────────────────────
+
+def build_permission_sets_index():
+    """
+    Field-level security from permission sets and profiles.
+    Enables "which profiles/perm sets can read or edit Product_Pillar__c" queries.
+
+    Output: list of {file, name, label, ptype, field_permissions: [{field, readable, editable}]}
+
+    field is in "Object.FieldApiName" format (as stored in the XML).
+    Only entries with readable=true or editable=true are included to keep the index small.
+    """
+    entries = []
+
+    def parse_fls(f, ptype):
+        try:
+            root = ET.parse(f).getroot()
+        except ET.ParseError:
+            return None
+
+        name  = f.name.split(".")[0]
+        label = root.findtext(tag("label")) or name
+
+        field_perms = []
+        for fp in root.findall(tag("fieldPermissions")):
+            field    = txt(fp, "field")   # e.g. "Opportunity.Product_Pillar__c"
+            readable = txt(fp, "readable") == "true"
+            editable = txt(fp, "editable") == "true"
+            if field and (readable or editable):
+                field_perms.append({
+                    "field":    field,
+                    "readable": readable,
+                    "editable": editable,
+                })
+
+        if not field_perms:
+            return None
+
+        return {
+            "file":              f.name,
+            "name":              name,
+            "label":             label,
+            "ptype":             ptype,
+            "field_permissions": field_perms,
+        }
+
+    for f in sorted(METADATA_DIR.glob("permissionsets/*.permissionset-meta.xml")):
+        entry = parse_fls(f, "PermissionSet")
+        if entry:
+            entries.append(entry)
+
+    for f in sorted(METADATA_DIR.glob("profiles/*.profile-meta.xml")):
+        entry = parse_fls(f, "Profile")
+        if entry:
+            entries.append(entry)
+
+    return entries
+
+
+# ─── Formula cross-reference index ───────────────────────────────────────────
+
+def build_formula_deps_index(fields_tsv):
+    """
+    For every formula field, extract all __c field references from the formula expression.
+    Enables upstream tracing: "this field is a formula that reads these source fields".
+
+    Input:  fields_tsv string (already built by build_fields_index)
+    Output: { "Object.FormulaField__c": ["ReferencedField__c", ...], ... }
+
+    Example: Opportunity.ARR_Engagement__c has formula TEXT(Product_Pillar__c)
+    → {"Opportunity.ARR_Engagement__c": ["Product_Pillar__c"]}
+    """
+    import csv
+    import io
+
+    deps = {}
+    reader = csv.reader(io.StringIO(fields_tsv), delimiter='\t')
+    next(reader, None)  # skip header
+    for row in reader:
+        if len(row) < 5:
+            continue
+        obj     = row[0]
+        field   = row[1]
+        formula = row[4].strip() if len(row) > 4 else ""
+        if not formula:
+            continue
+        refs = list(dict.fromkeys(re.findall(r'\b([A-Za-z][A-Za-z0-9_]*__c)\b', formula)))
+        if refs:
+            deps[f"{obj}.{field}"] = refs
+
+    return deps
 
 
 # ─── Manifest ────────────────────────────────────────────────────────────────
 
 def build_manifest(retrieved_at):
+    # Hash of this script — lets Phase 2 detect when indexes need rebuilding
+    script_hash = ""
+    try:
+        script_hash = hashlib.md5(Path(__file__).read_bytes()).hexdigest()
+    except Exception:
+        pass
+
     return {
         "retrieved_at":       retrieved_at,
         "index_generated_at": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
+        "index_script_hash":  script_hash,
         "flows":              len(list(METADATA_DIR.glob("flows/*.flow-meta.xml"))),
         "apex_classes":       len(list(METADATA_DIR.glob("classes/*.cls"))),
         "triggers":           len(list(METADATA_DIR.glob("triggers/*.trigger"))),
@@ -856,46 +1693,48 @@ def main():
     (CACHE_DIR / "fields-index.tsv").write_text(fields_tsv, encoding="utf-8")
     print(f"{fields_tsv.count(chr(10))} rows")
 
+    SEP = (",", ":")  # compact separators — no whitespace
+
     # Flows
     print("  flows...", end=" ", flush=True)
     flows = build_flows_index()
-    flows_json = json.dumps(flows, separators=(",", ":"))
-    (CACHE_DIR / "flows-index.json").write_text(flows_json, encoding="utf-8")
+    (CACHE_DIR / "flows-index.json").write_text(
+        json.dumps(compact_dict(flows), separators=SEP), encoding="utf-8")
     print(f"{len(flows)} flows")
 
     # Apex
     print("  apex...", end=" ", flush=True)
     apex = build_apex_index()
-    apex_json = json.dumps(apex, separators=(",", ":"))
-    (CACHE_DIR / "apex-index.json").write_text(apex_json, encoding="utf-8")
+    (CACHE_DIR / "apex-index.json").write_text(
+        json.dumps(compact_dict(apex), separators=SEP), encoding="utf-8")
     print(f"{len(apex)} classes")
 
     # Triggers
     print("  triggers...", end=" ", flush=True)
     triggers = build_triggers_index()
-    triggers_json = json.dumps(triggers, separators=(",", ":"))
-    (CACHE_DIR / "triggers-index.json").write_text(triggers_json, encoding="utf-8")
+    (CACHE_DIR / "triggers-index.json").write_text(
+        json.dumps(compact_dict(triggers), separators=SEP), encoding="utf-8")
     print(f"{len(triggers)} triggers")
 
     # Validation rules
     print("  validation-rules...", end=" ", flush=True)
     val_rules = build_validation_rules_index()
     (CACHE_DIR / "validation-rules-index.json").write_text(
-        json.dumps(val_rules, separators=(",", ":")), encoding="utf-8")
+        json.dumps(compact_dict(val_rules), separators=SEP), encoding="utf-8")
     print(f"{len(val_rules)} rules")
 
     # Workflow rules
     print("  workflow-rules...", end=" ", flush=True)
     wf_rules = build_workflow_rules_index()
     (CACHE_DIR / "workflow-rules-index.json").write_text(
-        json.dumps(wf_rules, separators=(",", ":")), encoding="utf-8")
+        json.dumps(compact_dict(wf_rules), separators=SEP), encoding="utf-8")
     print(f"{len(wf_rules)} rules")
 
     # Reports
     print("  reports...", end=" ", flush=True)
     reports = build_reports_index()
     (CACHE_DIR / "reports-index.json").write_text(
-        json.dumps(reports, separators=(",", ":")), encoding="utf-8")
+        json.dumps(compact_dict(reports), separators=SEP), encoding="utf-8")
     if reports:
         print(f"{len(reports)} reports")
     else:
@@ -905,30 +1744,85 @@ def main():
     print("  dashboards...", end=" ", flush=True)
     dashboards = build_dashboards_index()
     (CACHE_DIR / "dashboards-index.json").write_text(
-        json.dumps(dashboards, separators=(",", ":")), encoding="utf-8")
+        json.dumps(compact_dict(dashboards), separators=SEP), encoding="utf-8")
     print(f"{len(dashboards)} dashboards")
 
     # Comprehensive field usage (must run after val_rules and wf_rules are built)
     print("  field-usage...", end=" ", flush=True)
     field_usage = build_field_usage_index(flows, apex, triggers)
-    usage_json = json.dumps(field_usage, separators=(",", ":"))
-    (CACHE_DIR / "field-usage-index.json").write_text(usage_json, encoding="utf-8")
+    (CACHE_DIR / "field-usage-index.json").write_text(
+        json.dumps(compact_dict(field_usage), separators=SEP), encoding="utf-8")
     print(f"{len(field_usage)} fields")
 
     # Constants
     print("  constants...", end=" ", flush=True)
     constants = build_constants_index()
-    constants_json = json.dumps(constants, separators=(",", ":"))
-    (CACHE_DIR / "constants-index.json").write_text(constants_json, encoding="utf-8")
+    (CACHE_DIR / "constants-index.json").write_text(
+        json.dumps(compact_dict(constants), separators=SEP), encoding="utf-8")
     print(f"{len(constants)} constants")
 
     # CPQ field usage (parent-child)
     print("  cpq-field-usage...", end=" ", flush=True)
     cpq_usage = build_cpq_field_usage_index()
-    cpq_usage_json = json.dumps(cpq_usage, indent=2)
-    (CACHE_DIR / "cpq-field-usage-index.json").write_text(cpq_usage_json, encoding="utf-8")
-    total_parents = sum(len(v) for v in cpq_usage.values())
-    print(f"{total_parents} parent records across {len(cpq_usage)} types")
+    (CACHE_DIR / "cpq-field-usage-index.json").write_text(
+        json.dumps(compact_dict(cpq_usage), separators=SEP), encoding="utf-8")
+    total_parents = sum(len(v) for v in cpq_usage.items()
+                        if isinstance(v, list))
+    print(f"{sum(len(v) for k,v in cpq_usage.items() if k != '_constants')} parent records across {len(cpq_usage)-1} types")
+
+    # LWC + Aura components
+    print("  ui-components...", end=" ", flush=True)
+    ui_components = build_ui_components_index()
+    (CACHE_DIR / "ui-components-index.json").write_text(
+        json.dumps(compact_dict(ui_components), separators=SEP), encoding="utf-8")
+    lwc_count  = sum(1 for c in ui_components if c["type"] == "lwc")
+    aura_count = sum(1 for c in ui_components if c["type"] == "aura")
+    print(f"{lwc_count} LWC, {aura_count} Aura")
+
+    # Layouts
+    print("  layouts...", end=" ", flush=True)
+    layouts = build_layouts_index()
+    (CACHE_DIR / "layouts-index.json").write_text(
+        json.dumps(compact_dict(layouts), separators=SEP), encoding="utf-8")
+    print(f"{len(layouts)} layouts")
+
+    # Custom Metadata records
+    print("  custom-metadata...", end=" ", flush=True)
+    cmdt = build_custom_metadata_index()
+    (CACHE_DIR / "custom-metadata-index.json").write_text(
+        json.dumps(compact_dict(cmdt), separators=SEP), encoding="utf-8")
+    total_cmdt = sum(len(v) for v in cmdt.values())
+    print(f"{total_cmdt} records across {len(cmdt)} types")
+
+    # Quick Actions
+    print("  quick-actions...", end=" ", flush=True)
+    qactions = build_quick_actions_index()
+    (CACHE_DIR / "quick-actions-index.json").write_text(
+        json.dumps(compact_dict(qactions), separators=SEP), encoding="utf-8")
+    print(f"{len(qactions)} quick actions")
+
+    # Email templates
+    print("  email-templates...", end=" ", flush=True)
+    email_templates = build_email_templates_index()
+    (CACHE_DIR / "email-templates-index.json").write_text(
+        json.dumps(compact_dict(email_templates), separators=SEP), encoding="utf-8")
+    print(f"{len(email_templates)} templates")
+
+    # Permission sets + profiles (field-level security)
+    print("  permission-sets...", end=" ", flush=True)
+    perm_sets = build_permission_sets_index()
+    (CACHE_DIR / "permission-sets-index.json").write_text(
+        json.dumps(compact_dict(perm_sets), separators=SEP), encoding="utf-8")
+    ps_count = sum(1 for p in perm_sets if p.get("ptype") == "PermissionSet")
+    pr_count = sum(1 for p in perm_sets if p.get("ptype") == "Profile")
+    print(f"{ps_count} permission sets, {pr_count} profiles")
+
+    # Formula cross-refs (upstream field dependencies for formula fields)
+    print("  formula-deps...", end=" ", flush=True)
+    formula_deps = build_formula_deps_index(fields_tsv)
+    (CACHE_DIR / "formula-deps-index.json").write_text(
+        json.dumps(compact_dict(formula_deps), separators=SEP), encoding="utf-8")
+    print(f"{len(formula_deps)} formula fields with cross-refs")
 
     # Manifest
     manifest = build_manifest(retrieved_at)
@@ -941,7 +1835,11 @@ def main():
                   "validation-rules-index.json", "workflow-rules-index.json",
                   "reports-index.json", "dashboards-index.json",
                   "field-usage-index.json", "constants-index.json",
-                  "cpq-field-usage-index.json"]:
+                  "cpq-field-usage-index.json",
+                  "layouts-index.json", "custom-metadata-index.json",
+                  "quick-actions-index.json", "ui-components-index.json",
+                  "email-templates-index.json", "permission-sets-index.json",
+                  "formula-deps-index.json"]:
         p = CACHE_DIR / fname
         if p.exists():
             kb = p.stat().st_size / 1024

@@ -11,10 +11,6 @@
 # sf CLI org alias — run `sf org list` to see your aliases
 ORG_ALIAS=""
 
-# Login URL / instance URL
-ORG_INSTANCE=""           # e.g. https://myorg.sandbox.my.salesforce.com
-                          #  or  https://myorg.my.salesforce.com
-
 # Is Salesforce CPQ (SBQQ managed package) installed?
 CPQ_INSTALLED="false"     # true | false
 

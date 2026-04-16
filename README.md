@@ -81,7 +81,6 @@ Edit `org.config` — this is the only file you need to change:
 
 ```bash
 ORG_ALIAS="MyOrg"
-ORG_INSTANCE="https://myorg.sandbox.my.salesforce.com"
 CPQ_INSTALLED="true"   # or false
 ```
 
